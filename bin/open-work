@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# What's still open in Orca on every machine, for the weekly review with the operator of which
+# workspaces and lead chats to close (AGENTS.md → Closing a project). Leads are kept open
+# by default, so nothing closes on its own; this is the list to put to them.
+#
+#   open-work     one block per machine: every workspace that isn't a repo's main checkout,
+#                 and main checkouts that have chats open
+#
+# Each workspace line gives its repo/name, branch, linked PR and its state, last activity,
+# its chats (count by state and their names), and any lead of chiefofstaff's run in it
+# (active, or finished and kept open). Lines start with "close?" when nothing is working
+# there and the PR is merged or closed, or it has been idle 7+ days: suggestions only;
+# close nothing without the operator's OK.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+[ $# -eq 0 ] || { sed -n '2,13p' "$0"; exit 2; }
+run="$(ledger_field Run)"
+
+ps_json() { orca_anon worktree ps --json --limit 500 "$@" 2>&1 || true; }
+boxes=("$CHIEFOFSTAFF_HOST" "$(ps_json)")
+terms="$(orca_anon terminal list --json 2>/dev/null || true)"
+for i in "${!OTHER_HOSTS[@]}"; do
+  boxes+=("${OTHER_HOSTS[$i]}" "$(ps_json --environment "${OTHER_ENVS[$i]}")")
+  terms+="
+$(orca_anon terminal list --json --environment "${OTHER_ENVS[$i]}" 2>/dev/null || true)"
+done
+leads="$( [ -z "$run" ] || run_workers "$run" 2>/dev/null || true)"
+
+python3 - "${CHIEFOFSTAFF_NOW_MS:-}" "$leads" "$terms" "$OPERATOR_NAME" "${boxes[@]}" <<'PY'
+import json, sys, time
+now_ms, leads_txt, terms_txt, operator = sys.argv[1:5]
+machines = list(zip(sys.argv[5::2], sys.argv[6::2]))  # (name, worktree ps output), this machine first
+now = int(now_ms) / 1000 if now_ms else time.time()
+IDLE_DAYS = 7
+
+def first_json(text):
+    try:
+        return json.JSONDecoder().raw_decode(text.lstrip())[0]
+    except Exception:
+        return None
+
+# Live terminals on every machine. A kept-open record can outlive its terminal (a later
+# dispatch in it that wasn't kept open closed it), so a term_ handle missing here is gone.
+# Chat-mode workers (structworker_ handles) aren't terminals; their record stands, and so
+# does every record when any machine's list is missing.
+live, listed, pos = set(), 0, 0
+dec = json.JSONDecoder()
+while pos < len(terms_txt):
+    while pos < len(terms_txt) and terms_txt[pos].isspace():
+        pos += 1
+    try:
+        doc, pos = dec.raw_decode(terms_txt, pos)
+    except Exception:
+        nl = terms_txt.find("\n", pos)
+        if nl < 0:
+            break
+        pos = nl + 1
+        continue
+    r = doc.get("result") if isinstance(doc, dict) else None
+    if isinstance(r, dict) and "terminals" in r:
+        listed += 1
+        live |= {t.get("handle") for t in r["terminals"] if t.get("connected")}
+
+leads_by_ws, terminals = {}, set()
+for w in (json.loads(l) for l in leads_txt.splitlines() if l.strip()):
+    # Follow-ups reuse a lead's chat: Orca lists newest first, and only the newest dispatch
+    # in a terminal says whether that chat stays open.
+    term = w.get("terminal") or w.get("dispatchId")
+    if term in terminals:
+        continue
+    terminals.add(term)
+    ts = w.get("terminalState") or "-"
+    if ts == "retained" and listed == len(machines) and str(term).startswith("term_") and term not in live:
+        ts = "gone"
+    active = w.get("outcome") == "in_progress"
+    if not (active or ts == "retained"):
+        continue  # finished and closed: nothing left to review
+    leads_by_ws.setdefault(w.get("workspace"), []).append(
+        f"{w.get('dispatchId')} ({'active' if active else 'finished'}"
+        + (", kept open" if ts == "retained" else f", closes when done: {ts}" if active else "") + ")")
+
+def age(ms):
+    if not ms:
+        return "no activity recorded"
+    days = (now - ms / 1000) / 86400
+    return "active today" if days < 1 else f"idle {int(days)} d"
+
+def block(name, text):
+    d = first_json(text)
+    if not d or not d.get("ok", True):
+        err = ((d or {}).get("error") or {}).get("message") or text.strip()[:200] or "no answer"
+        return [f"{name}: can't list workspaces ({err})"]
+    r = d.get("result", d)
+    ws = r.get("worktrees", []) if isinstance(r, dict) else r
+    out, mains = [], []
+    for w in sorted(ws, key=lambda w: (w.get("repo") or "", w.get("displayName") or "")):
+        if w.get("isArchived"):
+            continue
+        agents = w.get("agents") or []
+        label = f"{w.get('repo')}/{w.get('displayName')}"
+        if w.get("isMainWorktree"):
+            if agents:
+                mains.append(f"{label} ({len(agents)} chat{'s' if len(agents) != 1 else ''})")
+            continue
+        by_state = {}
+        for a in agents:
+            by_state[a.get("state") or "?"] = by_state.get(a.get("state") or "?", 0) + 1
+        names = [(a.get("displayName") or a.get("conversationName") or a.get("taskTitle") or "").strip()
+                 for a in agents]
+        names = [n.splitlines()[0][:50] for n in names if n]
+        pr = w.get("linkedPR") or {}
+        branch = (w.get("branch") or "").replace("refs/heads/", "")
+        bits = [label + (f" ({branch})" if branch and branch != w.get("displayName") else "")]
+        if pr:
+            bits.append(f"PR #{pr.get('number')} {pr.get('state')}")
+        last = max(w.get("lastActivityAt") or 0, w.get("lastOutputAt") or 0)
+        bits.append(age(last))
+        if agents:
+            bits.append(f"{len(agents)} chat{'s' if len(agents) != 1 else ''} ("
+                        + ", ".join(f"{n} {s}" for s, n in sorted(by_state.items())) + ")"
+                        + (": " + "; ".join(f'"{n}"' for n in names[:3]) if names else ""))
+        else:
+            bits.append("no chats")
+        ls = leads_by_ws.get(w.get("worktreeId")) or []
+        if ls:
+            bits.append("chiefofstaff lead " + ", ".join(ls))
+        working = by_state.get("working") or any("active" in l for l in ls)
+        idle = not last or (now - last / 1000) / 86400 >= IDLE_DAYS
+        close = not working and (pr.get("state") in ("merged", "closed") or idle)
+        out.append(("  close? " if close else "  ") + "; ".join(bits))
+    head = f"{name}: {len(out)} workspace{'s' if len(out) != 1 else ''} besides main checkouts"
+    return [head] + out + ([f"  main checkouts with chats: {', '.join(mains)}"] if mains else [])
+
+print(f"Open workspaces and lead chats (AGENTS.md → Closing a project): ask {operator} which to close.")
+for name, text in machines:
+    print("\n".join(block(name, text)))
+PY

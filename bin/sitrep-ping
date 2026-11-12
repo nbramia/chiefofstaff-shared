@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Wake chiefofstaff by mailing its Orca run. Installed on every machine by bin/install-timers
+# (systemd on Linux, launchd on macOS); it only acts on the machine the ledger says
+# chiefofstaff runs on.
+#
+#   sitrep-ping [sitrep]   scheduled sitrep, with bin/lead-health's and bin/usage's reports
+#   sitrep-ping watch      every 15 min: mail only if bin/lead-health --watch found a new
+#                          problem or bin/usage --watch advises a change (including the 95%
+#                          pause starting or ending); `Threshold:` lines (80%/90% of a window)
+#                          also go to NOTIFY_CMD (chiefofstaff.conf), if set
+#   sitrep-ping retro      weekly: start a retrospective (AGENTS.md → Retrospectives), with
+#                          bin/open-work's list of open workspaces and lead chats for review
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+mode="${1:-sitrep}"
+chiefofstaff_pull 2>/dev/null || true
+host="$(ledger_field Host)"; run="$(ledger_field Run)"
+[ "$host" = "$CHIEFOFSTAFF_HOST" ] || exit 0
+[ -n "$run" ] || { echo "no chiefofstaff run in ledger.md" >&2; exit 1; }
+health() { "$CHIEFOFSTAFF_DIR/bin/lead-health" "$@" 2>&1 | head -c 4000 || true; }
+usage() { "$CHIEFOFSTAFF_DIR/bin/usage" "$@" 2>&1 | head -c 3000 || true; }
+open_work() {  # the whole list if it fits in a mail, else a cut-off note
+  local w; w="$("$CHIEFOFSTAFF_DIR/bin/open-work" 2>&1 || true)"
+  if [ "${#w}" -le 20000 ]; then printf '%s\n' "$w"
+  else printf '%s\n(list cut short: run bin/open-work for the rest)\n' "${w:0:20000}"; fi
+}
+
+case "$mode" in
+  sitrep)
+    subject="Scheduled sitrep"
+    body="Scheduled sitrep. Check Orca state and the ledger, then post the four-group update in this chat. If nothing changed since the last update, say so in one line. Any STALLED lead below goes under Broken.
+
+$(health)
+
+Usage (AGENTS.md → Usage and models):
+$(usage)" ;;
+  watch)
+    report="$("$CHIEFOFSTAFF_DIR/bin/lead-health" --watch)"
+    # A failed usage check must not ack an earlier, unsent alert.
+    uok=1; ureport="$("$CHIEFOFSTAFF_DIR/bin/usage" --watch 2>&1)" || { uok=""; ureport=""; }
+    [ -n "$report" ] || [ -n "$ureport" ] || exit 0
+    subject="" body=""
+    if [ -n "$report" ]; then
+      subject="Lead health alert"
+      body="bin/lead-health found a new problem. Look into it now (AGENTS.md → Lead health) and tell $OPERATOR_NAME under Broken.
+
+$report"
+    fi
+    if [ -n "$ureport" ]; then
+      subject="${subject:+$subject + }Usage alert"
+      body="${body:+$body
+
+}bin/usage advises a change: the Claude tier worsened, an account is near its limit, an account in use crossed 80% or 90% of a window (Threshold lines; they also go to $OPERATOR_NAME through the notify command, if one is set), or a machine's 95% pause started or ended (Pause and Resume lines: tell that machine's leads to stop at a safe point, or to carry on). Act on it (AGENTS.md → Usage and models).
+
+$ureport"
+    fi ;;
+  retro)
+    subject="Scheduled retrospective"
+    body="Weekly retrospective. Follow AGENTS.md → Retrospectives, then the weekly review in Closing a project step 5: put the list below to $OPERATOR_NAME and ask which to close.
+
+$(open_work)" ;;
+  *) echo "usage: sitrep-ping [sitrep|watch|retro]" >&2; exit 2 ;;
+esac
+# Mail first: if it fails, set -e stops here and nothing was sent, so the retry duplicates nothing.
+"$ORCA" orchestration send --to "run:$run" --from scheduler --type status \
+  --subject "$subject" --body "$body"
+# Threshold lines also go straight to the operator through the notify command: one
+# executable that takes the message as $1 (CHIEFOFSTAFF_NOTIFY, else NOTIFY_CMD from
+# chiefofstaff.conf; neither set means mail only). A failed send leaves usage unacked, so
+# the next run retries (and repeats the mail).
+notify_cmd="${CHIEFOFSTAFF_NOTIFY:-$NOTIFY_CMD}"
+notify() { "$notify_cmd" "$1"; }
+tok=1
+if [ "$mode" = watch ] && [ -n "$notify_cmd" ]; then
+  th="$(grep '^Threshold: ' <<<"$ureport" | sed 's/^Threshold: //' | paste -sd' ' - || true)"
+  if [ -n "$th" ]; then notify "chiefofstaff: usage: $th" || tok=""; fi
+fi
+# Only now count the watch problems as alerted; if a send failed, the next run retries.
+if [ "$mode" = watch ]; then
+  "$CHIEFOFSTAFF_DIR/bin/lead-health" --ack
+  [ -z "$uok" ] || [ -z "$tok" ] || "$CHIEFOFSTAFF_DIR/bin/usage" --ack || true
+fi

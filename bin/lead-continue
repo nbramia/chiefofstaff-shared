@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Give an existing chat new work as a lead, in the same session and context: a finished
+# lead (Orca refuses send/reply to a finished dispatch, and on another machine a reply is
+# silently lost), or any chat the operator wants adopted as a lead.
+#
+#   lead-continue <dispatch-id> (--spec-file <f> | --spec <text>) [--title <t>] [--dry-run]
+#       the lead that dispatch ran in: same terminal, workspace and machine
+#   lead-continue --terminal <handle> --worktree <selector> [--on <env>] (--spec-file <f> | --spec <text>) [--title <t>] [--dry-run]
+#       adopt any chat: its terminal handle (orca terminal list / worktree ps) and workspace
+#       (id:<repoId>::<path>); --on <environment> for a chat on another machine
+#
+# Starts a worker-start --terminal --keep-open dispatch in chiefofstaff's run (ledger), checks
+# with bin/keep-open that Orca will leave the chat open when it finishes, and prints the new
+# dispatch id: record it in the ledger. On another machine, do the receipt check next
+# (AGENTS.md → Leads).
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+
+dispatch=""; terminal=""; worktree=""; on=""; spec=(); title=""; dry=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --terminal) terminal="$2"; shift 2 ;;
+    --worktree) worktree="$2"; shift 2 ;;
+    --on) on="$2"; shift 2 ;;
+    --spec-file) spec=(--spec-file "$2"); shift 2 ;;
+    --spec) spec=(--spec "$2"); shift 2 ;;
+    --title) title="$2"; shift 2 ;;
+    --dry-run) dry=1; shift ;;
+    ctx_*) dispatch="$1"; shift ;;
+    *) sed -n '2,15p' "$0"; exit 2 ;;
+  esac
+done
+[ ${#spec[@]} -gt 0 ] || { echo "lead-continue: give --spec-file or --spec" >&2; exit 2; }
+
+if [ -n "$dispatch" ]; then
+  [ -z "$terminal$worktree$on" ] || { echo "lead-continue: give a dispatch id or --terminal/--worktree, not both" >&2; exit 2; }
+  read -r terminal worktree on < <("$ORCA" orchestration worker-show --dispatch "$dispatch" --full --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin).get("result") or {}
+except Exception:
+    r = {}
+w = r.get("worker") or {}
+t = r.get("terminal") or {}
+h = w.get("agentTerminalHandle") or t.get("handle") or "-"
+wt = w.get("worktreeId") or t.get("worktreeId") or "-"
+print(h, wt.replace(" ", "\x1f"), (r.get("server") or {}).get("name") or "-")') || true
+  worktree="${worktree//$'\x1f'/ }"
+  [ "$terminal" != - ] && [ -n "$terminal" ] && [ "$worktree" != - ] && [ -n "$worktree" ] \
+    || { echo "lead-continue: Orca can't show dispatch $dispatch's terminal and workspace (worker-show --dispatch $dispatch --full)" >&2; exit 1; }
+  [ "$on" != - ] || on=""
+  worktree="id:$worktree"
+fi
+[ -n "$terminal" ] && [ -n "$worktree" ] || { echo "lead-continue: --terminal and --worktree go together" >&2; exit 2; }
+
+run="$(ledger_field Run)"
+[ -n "$run" ] || { echo "lead-continue: no chiefofstaff run in ledger.md" >&2; exit 2; }
+# --keep-open: a reused terminal is closed when this dispatch finishes unless this dispatch
+# is kept open, even if earlier dispatches in it were (AGENTS.md → Leads, Keep open).
+cmd=("$ORCA" orchestration worker-start --run "$run" --terminal "$terminal" --worktree "$worktree"
+     --keep-open "${spec[@]}")
+[ -z "$on" ] || cmd+=(--on "$on")
+[ -z "$title" ] || cmd+=(--task-title "$title")
+if [ -n "$dry" ]; then printf 'would run:'; printf ' %q' "${cmd[@]}"; echo; exit 0; fi
+out="$("${cmd[@]}" 2>&1)" || { echo "lead-continue: worker-start failed:" >&2; echo "$out" >&2; exit 1; }
+echo "$out"
+new="$(grep -oE 'ctx_[0-9a-f]{12}' <<<"$out" | head -1 || true)"
+echo "lead-continue: ${new:-new dispatch} in terminal $terminal${on:+ on $on}. Record it in the ledger."
+if [ -n "$new" ]; then
+  "$CHIEFOFSTAFF_DIR/bin/keep-open" "$new" \
+    || echo "  Orca hasn't confirmed it will stay open: run bin/keep-open $new again, and tell $OPERATOR_NAME under Broken if it still fails." >&2
+fi
+[ -z "$on" ] || echo "  It runs on $on: send the receipt check now (AGENTS.md → Leads)."

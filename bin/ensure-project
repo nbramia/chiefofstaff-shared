@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Make a project ready to work on in Orca on this machine (or another one), doing only
+# the steps that are missing:
+#   1. folder on disk    (clone from GitHub if the repo exists there, else create it)
+#   2. git repo          (git init + first commit if needed)
+#   3. GitHub repo       (create it, private by default, and push; only for GITHUB_OWNER)
+#   4. Orca project      (import the folder: orca project setup-existing-folder)
+#
+#   ensure-project <name> [--owner <owner>] [--path <dir>] [--public] [--on <machine>] [--dry-run]
+#
+#   <name>      GitHub repo name (also the folder name unless --path)
+#   --owner     GitHub owner (default GITHUB_OWNER in chiefofstaff.conf)
+#   --path      folder on the target machine (default ~/$PROJECTS_REL/<name>)
+#   --public    make a newly created GitHub repo public (default private)
+#   --on        do it on another machine from MACHINES (runs this script there over ssh);
+#               --other is the same for the only other machine
+#   --dry-run   say what would happen, change nothing
+#
+# Prints what it did and the Orca repo id to use with worker-start --repo id:<id>.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+
+name=""; owner="$GITHUB_OWNER"; path=""; visibility=--private; on=""; dry=""
+projects="$HOME/${PROJECTS_REL:-Code}"
+args=("$@")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --owner) owner="$2"; shift 2 ;;
+    --path) path="$2"; shift 2 ;;
+    --public) visibility=--public; shift ;;
+    --other) [ ${#OTHER_HOSTS[@]} = 1 ] || { echo "ensure-project: --other needs exactly one other machine; use --on <machine>" >&2; exit 2; }
+             on="$OTHER_HOST"; shift ;;
+    --on) on="$2"; shift 2 ;;
+    --dry-run) dry=1; shift ;;
+    -*) echo "unknown option $1" >&2; exit 2 ;;
+    *) name="$1"; shift ;;
+  esac
+done
+[ -n "$name" ] || { sed -n '2,19p' "$0"; exit 2; }
+[ -n "$owner" ] || { echo "ensure-project: no GitHub owner: set GITHUB_OWNER in chiefofstaff.conf or pass --owner" >&2; exit 2; }
+
+if [ -n "$on" ] && [ "$on" != "$CHIEFOFSTAFF_HOST" ]; then
+  ssh_alias="$(machine_field "$on" ssh)"
+  [ -n "$ssh_alias" ] || { echo "ensure-project: no machine '$on' with an ssh alias in MACHINES" >&2; exit 2; }
+  rest=(); skip=""
+  for a in "${args[@]}"; do
+    if [ -n "$skip" ]; then skip=""; continue; fi
+    case "$a" in --other) ;; --on) skip=1 ;; *) rest+=("$(printf '%q' "$a")") ;; esac
+  done
+  exec ssh "$ssh_alias" "\$SHELL -lc 'cd ~/$CHIEFOFSTAFF_REL && git pull -q --ff-only && bin/ensure-project ${rest[*]}'"
+fi
+
+slug="$owner/$name"
+if [ -z "$path" ]; then
+  # Reuse an existing clone: one Orca already knows for this project, else one under
+  # ~/$PROJECTS_REL (up to 3 levels, e.g. <projects>/Personal/<name>) whose origin is this repo.
+  path="$("$ORCA" project setups --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin); r = d.get("result", d)
+xs = r.get("setups", r.get("projectHostSetups", r)) if isinstance(r, dict) else r
+for x in xs:
+    if x.get("hostId") == "local" and (x.get("projectId") or "").lower() == ("github:" + sys.argv[1]).lower():
+        print(x.get("path") or ""); break' "$slug")"
+  if [ -z "$path" ]; then
+    while IFS= read -r g; do
+      d="${g%/.git}"
+      u="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
+      case "$(tr 'A-Z' 'a-z' <<<"$u")" in
+        *"github.com:$(tr 'A-Z' 'a-z' <<<"$slug")"*|*"github.com/$(tr 'A-Z' 'a-z' <<<"$slug")"*) path="$d"; break ;;
+      esac
+    done < <(find "$projects" -maxdepth 4 -name .git -type d -not -path '*/orca/*' 2>/dev/null)
+  fi
+  path="${path:-$projects/$name}"
+fi
+ssh_url="git@github.com:$slug.git"
+did=()
+run() { if [ -n "$dry" ]; then echo "would: $*"; else "$@"; fi; }
+note() { did+=("$1"); }
+
+on_github() { gh repo view "$slug" --json name >/dev/null 2>&1; }
+
+gh_exists=""; on_github && gh_exists=1
+if [ -z "$gh_exists" ] && [ "$owner" != "$GITHUB_OWNER" ]; then
+  echo "ensure-project: $slug isn't on GitHub and I won't create repos outside ${GITHUB_OWNER:-GITHUB_OWNER}. Ask $OPERATOR_NAME." >&2; exit 3
+fi
+
+# Current state (tracked in variables so --dry-run reports every step).
+exists=""; has_git=""; has_commit=""; origin=""
+[ -e "$path" ] && exists=1
+[ -d "$path/.git" ] && has_git=1
+[ -n "$has_git" ] && git -C "$path" rev-parse -q --verify HEAD >/dev/null 2>&1 && has_commit=1
+[ -n "$has_git" ] && origin="$(git -C "$path" remote get-url origin 2>/dev/null || true)"
+
+# 1-2. Folder and git.
+if [ -z "$exists" ] && [ -n "$gh_exists" ]; then
+  run git clone -q "$ssh_url" "$path"; note "cloned $slug to $path"
+  exists=1; has_git=1; has_commit=1; origin="$ssh_url"
+fi
+if [ -z "$exists" ]; then run mkdir -p "$path"; note "created $path"; exists=1; fi
+if [ -z "$has_git" ]; then run git -C "$path" init -q -b main; note "git init"; has_git=1; fi
+if [ -z "$has_commit" ]; then
+  if [ ! -d "$path" ] || [ -z "$(ls -A "$path" | grep -v '^\.git$' || true)" ]; then
+    [ -n "$dry" ] || printf '# %s\n' "$name" > "$path/README.md"
+    note "added README.md"
+  fi
+  run git -C "$path" add -A
+  run git -C "$path" commit -qm "Initial commit"; note "first commit"; has_commit=1
+fi
+
+# 3. GitHub.
+if [ -n "$origin" ]; then
+  case "$origin" in
+    *"github.com:$slug.git"|*"github.com:$slug"|*"github.com/$slug"|*"github.com/$slug.git"|*"github.com/$slug/") ;;
+    *) echo "ensure-project: $path's origin is $origin, not $slug. Leaving it alone." >&2; exit 3 ;;
+  esac
+  [ -n "$gh_exists" ] || { echo "ensure-project: origin points at $slug but that GitHub repo doesn't exist or isn't visible." >&2; exit 3; }
+elif [ -n "$gh_exists" ]; then
+  run git -C "$path" remote add origin "$ssh_url"; note "set origin to $slug"
+else
+  run gh repo create "$slug" "$visibility" --source "$path" --remote origin --push
+  [ -n "$dry" ] || git -C "$path" remote set-url origin "$ssh_url"
+  note "created GitHub repo $slug (${visibility#--}) and pushed"
+fi
+
+# 4. Orca project on this machine.
+setup="$("$ORCA" project setups --json 2>/dev/null | python3 -c '
+import json, sys, os
+p = os.path.realpath(sys.argv[1])
+d = json.load(sys.stdin); r = d.get("result", d)
+xs = r.get("setups", r.get("projectHostSetups", r)) if isinstance(r, dict) else r
+for x in xs:
+    if x.get("hostId") == "local" and os.path.realpath(x.get("path") or "") == p:
+        print(x.get("setupMethod") or "?"); break' "$path")"
+if [ "$setup" != imported-existing-folder ] && [ "$setup" != cloned ]; then
+  if [ -n "$dry" ]; then
+    echo "would: $ORCA project setup-existing-folder --project github:$slug --host local --path $path --kind git"
+  elif ! out="$("$ORCA" project setup-existing-folder --project "github:$slug" --host local --path "$path" --kind git --json 2>&1)" \
+       || grep -q '"ok": *false' <<<"$out"; then
+    # Orca can know this folder under another project (a fork's upstream, say).
+    echo "ensure-project: Orca refused to add $path as project github:$slug${setup:+ (it has it as a $setup setup)}:" >&2
+    echo "  $(head -c 400 <<<"$out")" >&2
+    [ ${#did[@]} -eq 0 ] || printf '  done before that: %s\n' "${did[@]}" >&2
+    exit 1
+  fi
+  note "${setup:+upgraded legacy link; }added to Orca as project github:$slug"
+fi
+
+repo_id="$("$ORCA" repo list 2>/dev/null | awk -v p="$path" '$3 == p {print $1}' | head -1)"
+echo "ensure-project: $slug on $CHIEFOFSTAFF_HOST at $path"
+if [ ${#did[@]} -eq 0 ]; then echo "  already set up; nothing to do"; else printf '  %s\n' "${did[@]}"; fi
+echo "  orca repo id: ${repo_id:-<unknown${dry:+ (dry run)}>}"

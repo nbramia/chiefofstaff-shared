@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Make the calling Orca session chiefofstaff. Run it from the agent's own shell, in the main
+# checkout ~/$CHIEFOFSTAFF_REL (chiefofstaff.conf), on any machine listed in MACHINES.
+#
+# - Refuses if chiefofstaff isn't configured yet (exit 4: run the onboarding interview), if
+#   this isn't the main checkout, if another session is open in this chiefofstaff
+#   workspace, or if chiefofstaff is live on another machine.
+# - Same machine as the ledger says: takes over chiefofstaff's Orca run (creates a new one if
+#   it's gone). Another machine: chiefofstaff moves here with a new run, recorded in the ledger.
+# - Pulls the repo first. If that brought changes, restarts itself on the new
+#   version and says which instruction files changed, so the session re-reads them.
+# - Prints where the previous chat left off (bin/last-chat), unhandled mail, open tasks,
+#   bin/lead-health's report and ledger entries that need trimming.
+# Exit codes: 0 ok (ledger may need commit+push, it says so), 3 refused, 4 not configured.
+# Everything runs inside main(), so bash has read the whole file before a pull can change it.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+
+main() {
+
+refuse() { echo "chiefofstaff: NOT STARTED: $*" >&2; exit 3; }
+
+# 0. Configured: _common.sh already refused without chiefofstaff.conf.
+for f in operator.md ledger.md; do
+  [ -f "$CHIEFOFSTAFF_DIR/$f" ] || { echo "chiefofstaff: NOT CONFIGURED: $f doesn't exist. Run the onboarding interview (AGENTS.md → Onboarding)." >&2; exit 4; }
+done
+
+# 1. Main checkout only: worktrees would carry their own copy of the ledger.
+[ "$(cd "$CHIEFOFSTAFF_DIR" && git rev-parse --git-dir)" = "$(cd "$CHIEFOFSTAFF_DIR" && git rev-parse --git-common-dir)" ] \
+  || refuse "this is a worktree. Chiefofstaff runs only in the main checkout ~/$CHIEFOFSTAFF_REL."
+[ "$CHIEFOFSTAFF_DIR" = "$HOME/$CHIEFOFSTAFF_REL" ] || refuse "chiefofstaff must live at ~/$CHIEFOFSTAFF_REL (CHIEFOFSTAFF_REL in chiefofstaff.conf), not $CHIEFOFSTAFF_DIR."
+
+# 2. Sync with GitHub. If the pull changed anything, rerun the new version of this script.
+if [ -z "${CHIEFOFSTAFF_PULLED:-}" ]; then
+  before="$(git -C "$CHIEFOFSTAFF_DIR" rev-parse HEAD)"
+  chiefofstaff_pull || refuse "git pull failed in $CHIEFOFSTAFF_DIR (local changes or a diverged branch?); fix that first."
+  after="$(git -C "$CHIEFOFSTAFF_DIR" rev-parse HEAD)"
+  if [ "$before" != "$after" ]; then
+    files="$(git -C "$CHIEFOFSTAFF_DIR" diff --name-only "$before" "$after" | tr '\n' ' ')"
+    CHIEFOFSTAFF_PULLED=1 CHIEFOFSTAFF_UPDATED="$files" exec "$CHIEFOFSTAFF_DIR/bin/start-chiefofstaff" "$@"
+  fi
+fi
+if [ -n "${CHIEFOFSTAFF_UPDATED:-}" ]; then
+  echo "chiefofstaff: pulled updates from GitHub: $CHIEFOFSTAFF_UPDATED"
+  case " $CHIEFOFSTAFF_UPDATED " in *" AGENTS.md "*|*" README.md "*|*".claude/"*)
+    echo "  Your instructions changed since this session loaded them: re-read AGENTS.md (and"
+    echo "  README.md and any changed skill) before doing anything else." ;;
+  esac
+fi
+host="$(ledger_field Host)"; run="$(ledger_field Run)"
+
+# 3. One session here: this one.
+n_here="$(chiefofstaff_sessions)"
+[ "$n_here" -le 1 ] || refuse "$n_here sessions are open in the chiefofstaff workspace on $CHIEFOFSTAFF_HOST. Close the others, then start again."
+
+# 4. Not live on another machine.
+for i in "${!OTHER_HOSTS[@]}"; do
+  n_other="$(chiefofstaff_sessions --environment "${OTHER_ENVS[$i]}")"
+  if [ "$n_other" -gt 0 ]; then
+    refuse "chiefofstaff has $n_other open session(s) on ${OTHER_HOSTS[$i]}. Close them there first (Orca → chiefofstaff → main)."
+  elif [ "$n_other" -lt 0 ] && [ "$host" = "${OTHER_HOSTS[$i]}" ]; then
+    refuse "the ledger says chiefofstaff runs on $host and I can't reach its Orca (environment ${OTHER_ENVS[$i]}) to check it's closed."
+  fi
+done
+
+changed=""
+if [ "$host" = "$CHIEFOFSTAFF_HOST" ] && [ -n "$run" ] && "$ORCA" orchestration run-use --id "$run" >/dev/null 2>&1; then
+  echo "chiefofstaff: on $CHIEFOFSTAFF_HOST, took over run $run"
+else
+  if [ -n "$host" ] && [ "$host" != "$CHIEFOFSTAFF_HOST" ]; then
+    echo "chiefofstaff: moving from $host to $CHIEFOFSTAFF_HOST."
+    echo "  Leads still in the old run ($run on $host) report there, and nobody will read it:"
+    "$ORCA" orchestration task-list --run "$run" --environment "$(machine_field "$host" env)" 2>/dev/null \
+      | grep -vE 'status=(completed|cancelled|failed)' | sed 's/^/    /' || echo "    (couldn't list them)"
+    echo "  Tell $OPERATOR_NAME about any listed, and re-dispatch or finish them from here."
+  else
+    echo "chiefofstaff: run ${run:-<none>} unavailable on $CHIEFOFSTAFF_HOST; creating a new one"
+  fi
+  out="$("$ORCA" orchestration run-create --objective "chiefofstaff" 2>&1)"
+  run="$(grep -oE 'run_[0-9a-f]{12}' <<<"$out" | head -1)"
+  [ -n "$run" ] || { echo "run-create failed: $out" >&2; exit 1; }
+  ledger_set_run "$CHIEFOFSTAFF_HOST" "$run"
+  changed=1
+  echo "chiefofstaff: now on $CHIEFOFSTAFF_HOST with run $run"
+fi
+
+[ -z "$changed" ] || echo "ledger.md changed: commit and push it now (git -C ~/$CHIEFOFSTAFF_REL commit -am 'Chiefofstaff run: $CHIEFOFSTAFF_HOST $run' && git push)."
+
+echo
+echo "== Where the last chat left off =="
+"$CHIEFOFSTAFF_DIR/bin/last-chat" 2>&1 || echo "(couldn't read it)"
+[ -z "$changed" ] || [ "$host" = "$CHIEFOFSTAFF_HOST" ] || echo "  (chiefofstaff just moved from $host; its last chat there isn't shown)"
+echo
+echo "== Unhandled mail =="
+"$ORCA" orchestration inbox --terminal "run:$run" --limit 30 2>&1 | grep -B1 -A3 '\[unhandled\]' || echo "(none)"
+echo
+echo "== Open tasks =="
+"$ORCA" orchestration task-list --run "$run" 2>&1 | grep -vE 'status=(completed|cancelled)' || echo "(none)"
+echo
+echo "== Lead health =="
+"$CHIEFOFSTAFF_DIR/bin/lead-health" --run "$run" 2>&1 || echo "  Anything STALLED above goes under Broken in your first update."
+long="$(ledger_long_entries)"
+if [ -n "$long" ]; then
+  echo
+  echo "== Ledger entries to trim to current state (history stays in git) =="
+  echo "$long"
+fi
+}
+
+main "$@"

@@ -1,0 +1,13 @@
+# Folder workspaces for admin threads (AGENTS.md → Leads)
+admin/
+
+# Your own state: it describes you, your machines and your work. Your private copy tracks
+# these files anyway (git keeps tracking a file once it is added, ignored or not; add new
+# ones with `git add -f`). Ignoring them here keeps them out of an accidental commit to a
+# public checkout or an upstream pull request.
+/chiefofstaff.conf
+/operator.md
+/ledger.md
+/retros/
+/specs/*
+!/specs/_lead-template.md

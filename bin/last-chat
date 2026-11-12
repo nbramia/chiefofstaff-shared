@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Where the previous chiefofstaff chat left off: the operator's last message to it and its last
+# reply (which holds any open decision cards), from Claude Code's transcripts for
+# this checkout on this machine. Skips the calling session (CLAUDE_CODE_SESSION_ID).
+# bin/start-chiefofstaff prints it, so a new chat can answer "where were we" at once.
+#
+#   last-chat [--chars <n>]    (default 1500 characters of the reply)
+#
+# Transcripts: $CLAUDE_CONFIG_DIR/projects/<chiefofstaff path with / as ->/*.jsonl, else
+# ~/.claude/projects/…; CHIEFOFSTAFF_TRANSCRIPTS overrides the folder (tests).
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+chars=1500
+[ "${1:-}" != --chars ] || chars="$2"
+slug="${CHIEFOFSTAFF_DIR//\//-}"
+dir="${CHIEFOFSTAFF_TRANSCRIPTS:-}"
+if [ -z "$dir" ]; then
+  for d in "${CLAUDE_CONFIG_DIR:-}/projects/$slug" "$HOME/.claude/projects/$slug"; do
+    [ -d "$d" ] && { dir="$d"; break; }
+  done
+fi
+[ -n "$dir" ] && [ -d "$dir" ] || { echo "(no chiefofstaff transcripts on $CHIEFOFSTAFF_HOST)"; exit 0; }
+exec python3 - "$dir" "${CLAUDE_CODE_SESSION_ID:-}" "$chars" "$CHIEFOFSTAFF_HOST" "$OPERATOR_NAME" <<'PY'
+import calendar, glob, json, os, sys, time
+d, me, chars, host, operator = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
+files = sorted(glob.glob(os.path.join(d, "*.jsonl")), key=os.path.getmtime, reverse=True)
+files = [f for f in files if os.path.basename(f)[:-6] != me]
+if not me and files and time.time() - os.path.getmtime(files[0]) < 120:
+    files = files[1:]  # no session id: the file written in the last 2 min is probably ours
+
+def texts(e):
+    c = (e.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return [c]
+    return [b.get("text", "") for b in c or [] if isinstance(b, dict) and b.get("type") == "text"]
+
+def from_operator(t):  # not tool output, task notices, Orca mail or command wrappers
+    t = t.strip()
+    return t and not t.startswith(("<", "────", "[Request interrupted", "Caveat:"))
+
+for f in files[:5]:  # newest previous session that has a reply in it
+    said = asked = None
+    for line in open(f, errors="replace"):
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("isSidechain"):
+            continue
+        if e.get("type") == "assistant":
+            t = "\n".join(x for x in texts(e) if x.strip())
+            if t:
+                said = (e.get("timestamp"), t)
+        elif e.get("type") == "user":
+            t = "\n".join(x for x in texts(e) if from_operator(x))
+            if t:
+                asked = (e.get("timestamp"), t)
+    if not said:
+        continue
+    def when(ts):
+        try:
+            return time.strftime("%a %H:%M", time.localtime(
+                calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))))
+        except Exception:
+            return ts or "?"
+    print(f"Previous chat on {host}: {os.path.basename(f)[:8]}, last active {when(said[0])}")
+    if asked:
+        print(f"{operator[:1].upper() + operator[1:]}'s last message ({when(asked[0])}):")
+        print("  " + asked[1].strip()[:600].replace("\n", "\n  "))
+    reply = said[1].strip()
+    print(f"Its last reply ({when(said[0])}):")
+    print("  " + (reply[:chars] + (" …" if len(reply) > chars else "")).replace("\n", "\n  "))
+    sys.exit(0)
+print(f"(no earlier chiefofstaff chat with a reply on {host})")
+PY

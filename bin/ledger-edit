@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Edit ledger.md safely: replace one exact piece of text, and fail loudly when it isn't
+# there (or is there more than once) instead of silently changing nothing.
+#
+#   ledger-edit '<old text>' '<new text>'     replace; <old text> must occur exactly once
+#   ledger-edit --append '<project>' '<text>' add a sentence to the end of the
+#                                             "- **<project>**" entry under ## Projects
+#
+# Prints the edited entry or line. Exit 1 on no match, several matches, or no change.
+# Warns when a project entry is over the length limit (ledger_long_entries in _common.sh).
+# Pull before and commit + push after, as AGENTS.md says.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+[ $# -eq 2 ] || [ $# -eq 3 ] || { sed -n '2,11p' "$0"; exit 2; }
+python3 - "$LEDGER" "$@" <<'PY'
+import re, sys
+path, args = sys.argv[1], sys.argv[2:]
+s = open(path).read()
+def die(msg):
+    print(f"ledger-edit: {msg}; ledger.md unchanged", file=sys.stderr); sys.exit(1)
+if args[0] == "--append":
+    if len(args) != 3: die("--append needs <project> <text>")
+    proj, text = args[1], args[2].strip()
+    entries = list(re.finditer(r"^- \*\*" + re.escape(proj) + r"\*\*.*$", s, flags=re.M))
+    if len(entries) != 1: die(f"found {len(entries)} entries for project '{proj}'")
+    m = entries[0]
+    new_line = m.group(0).rstrip() + " " + text
+    out = s[:m.start()] + new_line + s[m.end():]
+    shown = new_line
+else:
+    if len(args) != 2: die("give <old text> <new text>")
+    old, new = args
+    n = s.count(old)
+    if n != 1: die(f"old text found {n} times, need exactly 1")
+    out = s.replace(old, new, 1)
+    shown = new
+if out == s: die("no change")
+open(path, "w").write(out)
+print(shown)
+PY
+long="$(ledger_long_entries)"
+if [ -n "$long" ]; then
+  echo "ledger-edit: entries over ${LEDGER_ENTRY_WORDS:-120} words; cut them to current state (what it is, lead and dispatch, what waits on whom), history stays in git:" >&2
+  sed 's/^/  /' <<<"$long" >&2
+fi

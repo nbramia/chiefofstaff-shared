@@ -1,0 +1,44 @@
+# chiefofstaff.conf: this operator's settings, read by every script in bin/ (bash syntax).
+# The onboarding interview (AGENTS.md → Onboarding) writes it from this example. Keep your
+# copy in your own private repo: it names your machines and accounts.
+
+# How chiefofstaff and leads refer to you in messages and updates.
+OPERATOR_NAME="the operator"
+
+# Where this repo lives on every machine, relative to $HOME. chiefofstaff runs only from
+# that main checkout, the same path on each machine.
+CHIEFOFSTAFF_REL="Code/chiefofstaff"
+
+# Where your project repos live, relative to $HOME (bin/ensure-project looks there for
+# existing clones and creates new folders there).
+PROJECTS_REL="Code"
+
+# The GitHub owner (user or org) bin/ensure-project may create new repos under. It never
+# creates repos for any other owner. Empty: never create repos.
+GITHUB_OWNER=""
+
+# Every machine chiefofstaff or its leads run on, one per line:
+#   "name|hostname|orca-environment|ssh-alias"
+# name               what the ledger, updates and reports call the machine
+# hostname           `hostname -s` on that machine; how a script knows where it runs
+# orca-environment   the name the other machines' Orca apps gave it when pairing
+#                    (`orca environment list` there); used with --on / --environment
+# ssh-alias          how the other machines reach it over ssh (an ~/.ssh/config Host)
+# One machine is fine: leave out the others.
+MACHINES=(
+  "desktop|my-desktop|desktop|desktop"
+  "laptop|my-laptop|laptop|laptop"
+)
+
+# Optional: one executable that gets a message as its only argument and sends it to you
+# (a phone push, a chat bot). Used for the 80% and 90% usage notices. Empty: those notices
+# go only to chiefofstaff's chat.
+NOTIFY_CMD=""
+
+# Scheduled wake-ups (bin/install-timers), in each machine's local time.
+SITREP_TIMES="08:30 12:30 17:30"
+WATCH_MINUTES=15
+RETRO_DAY="Sun"
+RETRO_TIME="16:00"
+# launchd label prefix on macOS (reverse-DNS style).
+TIMER_LABEL="local.chiefofstaff"

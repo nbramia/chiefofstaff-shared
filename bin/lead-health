@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# Is every lead in chiefofstaff's run actually reachable and moving? Prints one line per
+# active lead, plus any lead report chiefofstaff itself hasn't picked up.
+#
+#   lead-health            report (exit 0 all OK, 1 something needs attention, 2 error)
+#   lead-health --watch    print the report only if a problem appeared that hasn't been
+#                          alerted yet, else print nothing (used by `sitrep-ping watch`);
+#                          a failure of the check itself counts as a problem
+#   lead-health --ack      record the last --watch problems as alerted; sitrep-ping runs
+#                          it only after its alert was sent, so a failed send is retried
+#   lead-health --run <id> check another run instead of the ledger's
+#
+# A lead is STALLED when any of these holds:
+#   - Orca can't observe its process (observation.status isn't "live"; a lead on
+#     another machine started from here shows "identity_changed" when this breaks);
+#   - it is parked on a prompt only a human can answer (observation.agentWait);
+#   - mail to it (dispatch:<id>) has sat unhandled for MAIL_MIN minutes in either
+#     machine's inbox and it has shown no output for MAIL_MIN minutes either: it isn't
+#     receiving messages;
+#   - it runs on another machine and that machine's inbox can't be read.
+# An ok lead that has been quiet for QUIET_MIN minutes also gets a verdict, from its last
+# words and its open questions: "waiting" (on its own worker, a build or review, the
+# operator or chiefofstaff: Orca's "stopped without reporting" mail about it is noise) or "idle"
+# (it ended its turn without reporting and waits on nothing: ask it for status).
+# An active lead that Orca would close when it finishes (its terminal isn't "retained") is
+# kept open on the spot with worker-keep-open (AGENTS.md → Leads, Keep open by default) and
+# the report says so; if that fails, it is a problem.
+# Mail to a finished lead (its task completed) is flagged: Orca won't deliver it, and the
+# lead needs bin/lead-continue instead.
+# Chiefofstaff is behind when a question, decision gate, escalation or worker_done to its run
+# has sat unhandled for CHIEFOFSTAFF_MIN minutes.
+# Orca's inbox has no timestamps, so ages count from when this script first saw the
+# message (state in ${CHIEFOFSTAFF_STATE_DIR:-~/.local/state/chiefofstaff}); run it regularly.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+
+watch=""; run=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --watch) watch=1; shift ;;
+    --ack) watch=ack; shift ;;
+    --run) run="$2"; shift 2 ;;
+    *) sed -n '2,20p' "$0"; exit 2 ;;
+  esac
+done
+run="${run:-$(ledger_field Run)}"
+[ -n "$run" ] || { echo "lead-health: no chiefofstaff run in ledger.md" >&2; exit 2; }
+state="${CHIEFOFSTAFF_STATE_DIR:-$HOME/.local/state/chiefofstaff}"
+mkdir -p "$state"
+
+workers=""; wok=""
+if [ "$watch" != ack ] && workers="$(run_workers "$run" 2>/dev/null)"; then wok=1; fi
+export LEAD_HEALTH_WORKERS="$workers" LEAD_HEALTH_WORKERS_OK="$wok"
+exec python3 - "$ORCA" "$run" "$CHIEFOFSTAFF_HOST" "$state/lead-health.json" "$watch" "$OPERATOR_NAME" <<'PY'
+import json, os, subprocess, sys, time
+
+orca, run, host, state_path, watch, operator = sys.argv[1:7]
+MAIL_MIN = int(os.environ.get("LEAD_HEALTH_MAIL_MIN", "15"))
+CHIEFOFSTAFF_MIN = int(os.environ.get("LEAD_HEALTH_CHIEFOFSTAFF_MIN", "30"))
+QUIET_MIN = int(os.environ.get("LEAD_HEALTH_QUIET_MIN", "10"))
+FINISHED_MAIL_HOURS = 24  # stop flagging mail to a finished lead a day after first seeing it
+import re
+# The operator, as leads name them: "the operator", or the name in chiefofstaff.conf.
+WHO = "|".join(re.escape(w) for w in {"operator", *operator.split()} if w.lower() not in ("the", "a"))
+WAITING = re.compile(
+    r"\b(wait(s|ing)?|until|once|when)\b[^.\n]{0,80}\b(worker|builder|reviewer|review|agent|"
+    r"build|CI|checks?|ship|deploy|merge|" + WHO + r"|chiefofstaff|answer|reply|decision|approval|"
+    r"him|her|them|you|results?|reports?|back)\b"
+    r"|\b(Orca (will )?wakes? me|is back with|still (being )?(built|running|building|reviewing))\b"
+    r"|\b(paused|on hold)\b", re.I)
+NOT_WAITING = re.compile(r"\b(not|no longer|nothing to|stopped) wait|\b(stuck|blocked|failed|can't continue)\b", re.I)
+now = time.time()
+
+def save(st):  # atomic, so an overlapping run never reads half a file
+    tmp = f"{state_path}.{os.getpid()}"
+    json.dump(st, open(tmp, "w"))
+    os.replace(tmp, state_path)
+
+# A caller's Orca session id only identifies it on its own host; paired-server calls
+# refuse it (session_caller_host_boundary). This script acts as nobody, so drop it.
+env = {k: v for k, v in os.environ.items() if k not in (
+    "ORCA_AGENT_SESSION_ID", "ORCA_TERMINAL_HANDLE", "ORCA_AGENT_SESSION_SPAWN_TOKEN",
+    "ORCA_STRUCTURED_SESSION")}
+
+def call(*args):
+    """Run orca with --json; return (result, None) or (None, error text)."""
+    try:
+        p = subprocess.run([orca, *args, "--json"], capture_output=True, text=True,
+                           env=env, timeout=60)
+    except Exception as e:
+        return None, str(e)
+    try:
+        d = json.loads(p.stdout)
+    except Exception:
+        return None, (p.stderr or p.stdout).strip()[:200] or f"exit {p.returncode}"
+    if not d.get("ok", True):
+        e = d.get("error") or {}
+        return None, f"{e.get('code', '?')}: {e.get('message', '')}"[:200]
+    return d.get("result", d), None
+
+def messages(*extra):
+    r, err = call("orchestration", "inbox", "--limit", "5000", *extra)
+    if r is None:
+        return None, err
+    return (r.get("messages", []) if isinstance(r, dict) else r), None
+
+try:
+    st = json.load(open(state_path))
+except Exception:
+    st = {}
+seen = st.get("seen", {})
+
+if watch == "ack":
+    st["alerted"] = st.get("pending", [])
+    save(st)
+    sys.exit(0)
+
+def fatal(msg):
+    print(f"lead-health: {msg}", file=sys.stderr)
+    if watch:  # alert once per kind of failure, so a dead watchdog doesn't go unnoticed
+        sig = "lead-health-error:" + msg.split(":")[0]
+        st["pending"] = [sig]
+        if sig not in st.get("alerted", []):
+            print(f"lead-health itself failed on {host}: {msg}")
+        save(st)
+        code = 0
+    else:
+        code = 2
+    sys.stdout.flush(); sys.stderr.flush()
+    os._exit(code)  # also safe from inside sys.excepthook
+
+if watch:  # any crash is a failure of the check, alerted like the others
+    sys.excepthook = lambda t, e, tb: fatal(f"crashed: {t.__name__}: {e}")
+
+def first_seen(mid):
+    seen.setdefault(mid, now)
+    return seen[mid]
+
+def mins(t):
+    return int((now - t) // 60)
+
+r, err = call("orchestration", "task-list", "--run", run)
+if r is None:
+    fatal(f"can't list run {run}: {err}")
+tasks = r.get("tasks", [])
+active = [t for t in tasks
+          if t.get("dispatchId") and t.get("status") not in ("completed", "cancelled", "failed")]
+titles = {t["id"]: t.get("title") for t in tasks}
+active_ids = {t["dispatchId"] for t in active}
+
+inboxes = {}
+local_msgs, err = messages()
+inboxes[host] = local_msgs if local_msgs is not None else []
+if local_msgs is None:
+    fatal(f"can't read this machine's inbox: {err}")
+remote = {}  # environment -> (messages or None, error), read once per run
+def remote_inbox(env):
+    if env not in remote:
+        remote[env] = messages("--environment", env)
+    return remote[env]
+def all_boxes():
+    return [(host, inboxes[host])] + [(e, m) for e, (m, _) in remote.items() if m is not None]
+
+def terminal_states():
+    """dispatch -> terminalState from Orca's worker accounting (run_workers), or None."""
+    if not os.environ.get("LEAD_HEALTH_WORKERS_OK"):
+        return None
+    ws = [json.loads(l) for l in os.environ.get("LEAD_HEALTH_WORKERS", "").splitlines() if l.strip()]
+    return {w.get("dispatchId"): w.get("terminalState") for w in ws}
+tstates = terminal_states() if active and watch != "ack" else None
+
+lines, problems = [], []   # problems: (signature, text)
+for t in active:
+    d = t["dispatchId"]
+    name = (t.get("title") or t["id"])[:60]
+    w, err = call("orchestration", "worker-show", "--dispatch", d, "--full")
+    where = host
+    issues = []
+    if w is None:
+        issues.append(("show", f"Orca can't show it ({err})"))
+        w = {}
+    renv = (w.get("server") or {}).get("name")
+    if renv:
+        where = renv
+        remote_msgs, remote_err = remote_inbox(renv)
+    obs = w.get("observation")
+    if w and not obs:
+        issues.append(("obs", "Orca has no observation of it"))
+    elif obs:
+        if obs.get("status") != "live":
+            issues.append(("obs", f"Orca can't see its process ({obs.get('status')})"))
+        wait = obs.get("agentWait")
+        if wait:
+            issues.append(("wait", "parked on a prompt in its terminal ("
+                           + json.dumps(wait)[:120] + "); read it with orca terminal read --screen"))
+    # Last output, from its transcript or terminal.
+    # worker-read's first page isn't the newest: follow nextCursor to the end.
+    last, cursor = None, None
+    said, said_at = None, 0  # its last words: newest assistant text
+    used = set()
+    for _ in range(200):
+        rd, _ = call("orchestration", "worker-read", "--dispatch", d, "--limit", "50",
+                     *(["--cursor", cursor] if cursor else []))
+        tr = (rd or {}).get("transcript") or {}
+        ts = [m.get("timestamp") for m in tr.get("messages", [])
+              if isinstance(m.get("timestamp"), (int, float))]
+        if ts:
+            last = max(last or 0, max(ts) / 1000)
+        for m in tr.get("messages", []):
+            text = " ".join(b.get("text", "") for b in m.get("blocks") or []
+                            if b.get("type") == "text").strip()
+            t_m = m.get("timestamp") or 0
+            if m.get("role") == "assistant" and text and t_m >= said_at:
+                said, said_at = text, t_m
+        cursor = tr.get("nextCursor")
+        if not tr.get("messages") or not cursor or cursor in used:
+            break
+        used.add(cursor)
+    # Mail to it that nobody picked up.
+    boxes = [(host, inboxes[host])]
+    if renv:
+        if remote_msgs is None:
+            issues.append(("remote-inbox", f"can't read {renv}'s inbox to check its mail ({remote_err})"))
+        else:
+            boxes.append((renv, remote_msgs))
+    for box, msgs in boxes:
+        stuck = [m for m in msgs if m.get("to") == f"dispatch:{d}" and not m.get("handled")]
+        if not stuck:
+            continue
+        oldest = min(first_seen(m["id"]) for m in stuck)
+        quiet_since = max(oldest, last or 0)  # output after the mail arrived resets the clock
+        if mins(oldest) >= MAIL_MIN and mins(quiet_since) >= MAIL_MIN:
+            issues.append(("mail", f"{len(stuck)} message(s) to it unread for at least "
+                                   f"{mins(oldest)} min in {box}'s inbox: it isn't getting messages"))
+    kept = ""
+    ts_ = (tstates or {}).get(d)
+    if ts_ and ts_ not in ("retained", "released"):
+        k, kerr = call("orchestration", "worker-keep-open", "--dispatch", d)
+        if k is not None and k.get("state") == "retained":
+            kept = f"; was set to close when it finishes (terminal {ts_}), kept open now"
+        else:
+            issues.append(("keep-open", f"Orca will close its chat when it finishes (terminal {ts_}) "
+                                        f"and worker-keep-open failed ({kerr or k}); run bin/keep-open {d}"))
+    status = "STALLED" if issues else "ok"
+    act = f"last output {time.strftime('%H:%M', time.localtime(last))} ({mins(last)} min ago)" if last else "last output unknown"
+    # Why an ok lead is quiet: an open question of its own, or its last words.
+    verdict = ""
+    if not issues and (last is None or mins(last) >= QUIET_MIN):
+        asked = [m for _, box in all_boxes() for m in box
+                 if m.get("from") == d and m.get("type") in ("question", "decision_gate")
+                 and not m.get("handled")]
+        tail = (said or "")[-400:]
+        if asked or (WAITING.search(tail) and not NOT_WAITING.search(tail)):
+            verdict = "; waiting" + (" on its question to chiefofstaff" if asked else "")
+        else:
+            verdict = "; idle (ended its turn, waits on nothing: ask it for status)"
+    lines.append(f"  {status:<8} {name} [{d}] on {where}; {act}{verdict}{kept}")
+    if said:
+        flat = " ".join(said.replace("… (truncated)", "").split())
+        lines.append("           said: \"" + ("…" + flat[-160:] if len(flat) > 160 else flat) + "\"")
+    for sig, text in issues:
+        lines.append(f"           - {text}")
+        problems.append((f"{d}:{sig}", f"{name}: {text}"))
+
+# Mail to a finished lead: Orca never delivers it (a finished dispatch takes no
+# follow-ups), so the lead never hears it. bin/lead-continue reopens the same chat.
+# Completed tasks drop their dispatchId from task-list, so ask worker-show about each
+# dispatch that has unread mail and isn't active.
+finished = {}
+def finished_task(d):
+    if d not in finished:
+        w, _ = call("orchestration", "worker-show", "--dispatch", d, "--full")
+        disp = (w or {}).get("dispatch") or {}
+        ok = disp.get("runId") == run and (disp.get("status") == "completed"
+                                           or ((w or {}).get("worker") or {}).get("state") == "succeeded")
+        finished[d] = titles.get(disp.get("taskId")) or d if ok else None
+    return finished[d]
+for box, msgs in all_boxes():
+    for m in msgs:
+        to = m.get("to") or ""
+        d = to[len("dispatch:"):] if to.startswith("dispatch:") else ""
+        if not d or d in active_ids or m.get("handled"):
+            continue
+        if (now - first_seen(m["id"])) / 3600 >= FINISHED_MAIL_HOURS:
+            continue
+        title = finished_task(d)
+        if not title:
+            continue
+        name = title[:60]
+        lines.append(f"  UNSENT   mail {m['id']} to finished lead {name} [{d}]: "
+                     f"\"{(m.get('subject') or '')[:60]}\" will never reach it; resend with "
+                     f"bin/lead-continue {d} --spec-file <file>")
+        problems.append((f"{d}:finished-mail:{m['id']}", f"{name}: mail {m['id']} sent after it finished"))
+
+behind = []
+for m in inboxes[host]:
+    if (m.get("to") == f"run:{run}" and not m.get("handled")
+            and m.get("type") in ("question", "decision_gate", "escalation", "worker_done")):
+        age = mins(first_seen(m["id"]))
+        if age >= CHIEFOFSTAFF_MIN:
+            behind.append(f"  {m['type']} {m['id']} from {m.get('from')}: \"{(m.get('subject') or '')[:60]}\", unhandled for at least {age} min")
+            problems.append((f"chiefofstaff:{m['id']}", f"chiefofstaff hasn't handled {m['type']} {m['id']}"))
+
+# Forget messages that are gone or handled, so the state file stays small.
+live_ids = {m["id"] for _, box in all_boxes() for m in box if not m.get("handled")}
+seen = {k: v for k, v in seen.items() if k in live_ids}
+sigs = sorted(s for s, _ in problems)
+alerted = st.get("alerted", [])
+new = [s for s in sigs if s not in alerted]
+# Problems that cleared are dropped from "alerted" right away, so they alert again if
+# they come back; new ones join it only on --ack, after the alert went out.
+# Only --watch sets "pending", so --ack acknowledges exactly what the watch run reported.
+st = {"seen": seen, "alerted": [s for s in alerted if s in sigs],
+      "pending": sigs if watch else st.get("pending", [])}
+save(st)
+
+report = [f"Lead health, run {run}, {time.strftime('%H:%M')} on {host}:"]
+report += lines or ["  (no active leads)"]
+if behind:
+    report += ["Lead reports chiefofstaff hasn't handled:"] + behind
+if watch:
+    if new:
+        print("\n".join(report))
+    sys.exit(0)
+print("\n".join(report))
+sys.exit(1 if problems else 0)
+PY

@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Install chiefofstaff's scheduled wake-ups on this machine, from chiefofstaff.conf:
+#   sitrep  at each of SITREP_TIMES (default 08:30 12:30 17:30)
+#   watch   every WATCH_MINUTES minutes (default 15)
+#   retro   weekly at RETRO_DAY RETRO_TIME (default Sun 16:00)
+# All three run bin/sitrep-ping, which acts only on the machine the ledger names. Install
+# them on every machine in MACHINES, so chiefofstaff can move between machines.
+#
+#   install-timers                 write the units and enable them (systemd on Linux,
+#                                  launchd on macOS); rerun after changing the schedule
+#   install-timers --out <dir>     only write the unit files into <dir> (tests, review)
+#   install-timers --remove        disable and delete them
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+
+out=""; remove=""
+case "${1:-}" in
+  "") ;;
+  --out) out="${2:?--out needs a folder}" ;;
+  --remove) remove=1 ;;
+  *) sed -n '2,12p' "$0"; exit 2 ;;
+esac
+read -r -a sitrep_times <<<"${SITREP_TIMES:-08:30 12:30 17:30}"
+watch_min="${WATCH_MINUTES:-15}"
+retro_day="${RETRO_DAY:-Sun}"; retro_time="${RETRO_TIME:-16:00}"
+label="${TIMER_LABEL:-local.chiefofstaff}"
+ping="$CHIEFOFSTAFF_DIR/bin/sitrep-ping"
+jobs=(sitrep watch retro)
+
+hh() { echo "$((10#${1%%:*}))"; }
+mm() { echo "$((10#${1##*:}))"; }
+for t in "${sitrep_times[@]}" "$retro_time"; do
+  [[ "$t" =~ ^[0-2]?[0-9]:[0-5][0-9]$ ]] || { echo "install-timers: '$t' isn't HH:MM" >&2; exit 2; }
+done
+[[ "$watch_min" =~ ^[0-9]+$ ]] && [ "$watch_min" -ge 1 ] && [ "$watch_min" -le 60 ] \
+  || { echo "install-timers: WATCH_MINUTES must be 1-60" >&2; exit 2; }
+days=(Sun Mon Tue Wed Thu Fri Sat); wday=""
+for i in "${!days[@]}"; do [ "${days[$i]}" = "$retro_day" ] && wday="$i"; done
+[ -n "$wday" ] || { echo "install-timers: RETRO_DAY must be one of ${days[*]}" >&2; exit 2; }
+
+os="$(uname -s)"
+if [ "$os" = Darwin ]; then dest="${out:-$HOME/Library/LaunchAgents}"; else dest="${out:-$HOME/.config/systemd/user}"; fi
+
+if [ -n "$remove" ]; then
+  for j in "${jobs[@]}"; do
+    if [ "$os" = Darwin ]; then
+      launchctl bootout "gui/$(id -u)/$label-$j" 2>/dev/null || true
+      rm -f "$dest/$label-$j.plist"
+    else
+      systemctl --user disable --now "chiefofstaff-$j.timer" 2>/dev/null || true
+      rm -f "$dest/chiefofstaff-$j.timer" "$dest/chiefofstaff-$j.service"
+    fi
+  done
+  [ "$os" = Darwin ] || systemctl --user daemon-reload
+  echo "install-timers: removed"; exit 0
+fi
+
+mkdir -p "$dest"
+# Both kinds are written when --out is given, so either can be checked on any machine.
+write_systemd() {
+  local j
+  for j in "${jobs[@]}"; do
+    printf '[Unit]\nDescription=chiefofstaff: %s\n\n[Service]\nType=oneshot\nExecStart=%s%s\n' \
+      "$j" "$ping" "$([ "$j" = sitrep ] || echo " $j")" > "$dest/chiefofstaff-$j.service"
+  done
+  {
+    printf '[Unit]\nDescription=chiefofstaff: sitrep\n\n[Timer]\n'
+    for t in "${sitrep_times[@]}"; do printf 'OnCalendar=*-*-* %02d:%02d:00\n' "$(hh "$t")" "$(mm "$t")"; done
+    printf '\n[Install]\nWantedBy=timers.target\n'
+  } > "$dest/chiefofstaff-sitrep.timer"
+  printf '[Unit]\nDescription=chiefofstaff: lead-health and usage watch\n\n[Timer]\nOnCalendar=*-*-* *:00/%d:00\n\n[Install]\nWantedBy=timers.target\n' \
+    "$watch_min" > "$dest/chiefofstaff-watch.timer"
+  printf '[Unit]\nDescription=chiefofstaff: weekly retrospective\n\n[Timer]\nOnCalendar=%s *-*-* %02d:%02d:00\n\n[Install]\nWantedBy=timers.target\n' \
+    "$retro_day" "$(hh "$retro_time")" "$(mm "$retro_time")" > "$dest/chiefofstaff-retro.timer"
+}
+write_launchd() {
+  python3 - "$dest" "$label" "$ping" "$watch_min" "$wday" "$(hh "$retro_time")" "$(mm "$retro_time")" "${sitrep_times[@]}" <<'PY'
+import plistlib, sys
+dest, label, ping, watch, wday, rh, rm, *times = sys.argv[1:]
+path = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+def job(name, args, when):
+    p = {"Label": f"{label}-{name}", "ProgramArguments": ["/bin/bash", ping, *args],
+         "EnvironmentVariables": {"PATH": path},
+         "StandardErrorPath": f"/tmp/chiefofstaff-{name}.err", **when}
+    with open(f"{dest}/{label}-{name}.plist", "wb") as f:
+        plistlib.dump(p, f)
+hm = lambda t: {"Hour": int(t.split(":")[0]), "Minute": int(t.split(":")[1])}
+job("sitrep", [], {"StartCalendarInterval": [hm(t) for t in times]})
+job("watch", ["watch"], {"StartInterval": int(watch) * 60})
+job("retro", ["retro"], {"StartCalendarInterval": [{"Weekday": int(wday), "Hour": int(rh), "Minute": int(rm)}]})
+PY
+}
+
+if [ -n "$out" ]; then
+  write_systemd; write_launchd
+  echo "install-timers: wrote systemd and launchd units to $dest"; exit 0
+fi
+if [ "$os" = Darwin ]; then
+  write_launchd
+  for j in "${jobs[@]}"; do
+    launchctl bootout "gui/$(id -u)/$label-$j" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$dest/$label-$j.plist"
+  done
+  echo "install-timers: loaded $label-{sitrep,watch,retro} (launchctl print gui/$(id -u)/$label-<job>)"
+else
+  write_systemd
+  systemctl --user daemon-reload
+  for j in "${jobs[@]}"; do systemctl --user enable --now "chiefofstaff-$j.timer" >/dev/null; done
+  echo "install-timers: enabled chiefofstaff-{sitrep,watch,retro}.timer (systemctl --user list-timers 'chiefofstaff-*')"
+fi

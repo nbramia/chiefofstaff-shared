@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# List or switch the Claude/Codex account Orca uses for new agent sessions.
+#   orca-account [claude|codex]                 list (default: both); * = active
+#   orca-account claude|codex <email|id>        select for new sessions
+#   orca-account claude <email|id> --move       Claude only: also move running sessions
+# Talks to the local Orca app's runtime (same call as its account switcher).
+# Linux (/opt/Orca) and macOS (/Applications/Orca.app); ORCA_APP overrides. For another machine's Orca app, set
+# ORCA_ENVIRONMENT=<its paired environment name>.
+set -euo pipefail
+# ORCA_APP: the Orca install folder, when it isn't /opt/Orca or /Applications/Orca.app.
+app="${ORCA_APP:-}"; [ -n "$app" ] || { [ -d /opt/Orca ] && app=/opt/Orca; } || app=/Applications/Orca.app
+if [ -d "$app/resources" ]; then
+  bin="$app/orca-ide"; res="$app/resources"
+else
+  bin="$app/Contents/MacOS/Orca"; res="$app/Contents/Resources"
+fi
+export ORCA_CLIENT_JS="$res/app.asar.unpacked/out/cli/runtime/client.js"
+exec env ELECTRON_RUN_AS_NODE=1 "$bin" - "$@" <<'JS'
+const { RuntimeClient } = require(process.env.ORCA_CLIENT_JS);
+const args = process.argv.slice(2);
+const move = args.includes('--move');
+const pos = args.filter(a => !a.startsWith('--'));
+const kind = pos[0];
+const want = pos[1];
+if (kind && !['claude', 'codex'].includes(kind)) { console.error('kind must be claude or codex'); process.exit(2); }
+const desc = a => [a.email, a.label, a.planType || a.plan, a.orgName || a.workspaceLabel].filter(Boolean).join(' · ');
+(async () => {
+  const c = new RuntimeClient();
+  const s = (await c.call('accounts.list', {})).result;
+  if (!want) {
+    for (const k of kind ? [kind] : ['claude', 'codex']) {
+      console.log(`${k}:`);
+      for (const a of s[k].accounts || []) console.log(`  ${a.id === s[k].activeAccountId ? '*' : ' '} ${desc(a)}  [${a.id}]`);
+    }
+    return;
+  }
+  const hits = (s[kind].accounts || []).filter(a => a.id === want || a.email === want);
+  if (hits.length !== 1) {
+    console.error(hits.length ? `"${want}" matches ${hits.length} ${kind} accounts; pass the id:` : `no ${kind} account "${want}"`);
+    for (const a of hits) console.error(`  ${desc(a)}  [${a.id}]`);
+    process.exit(2);
+  }
+  const id = hits[0].id;
+  if (kind === 'claude') await c.call('accounts.selectClaude', move ? { accountId: id, movesRunningSessions: true } : { accountId: id }, { timeoutMs: 30000 });
+  else await c.call('accounts.selectCodex', { accountId: id }, { timeoutMs: 30000 });
+  console.log(`${kind}: selected ${desc(hits[0])} [${id}]${kind === 'claude' && move ? ' (running sessions moved)' : ' (new sessions)'}`);
+})().catch(e => { console.error('ERR', e.code ?? '', e.message); process.exit(1); });
+JS

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Claude and Codex usage for every account, read from Orca on every machine in
+# chiefofstaff.conf (the same account on several machines merges by email), with the Claude tier and account-switch advice.
+#   usage            report
+#   usage --json     same, as JSON
+#   usage --watch    print the report only if the tier worsened, a new switch is advised, or an
+#                    account in use crossed 80% or 90% of a window, or a machine's 95% pause
+#                    started or ended (AGENTS.md → Pause at 95%), since the last alert; the
+#                    `Pause: ...`, `Resume: ...` and `Threshold: ...` lines come first (used by
+#                    `sitrep-ping watch`)
+#   usage --ack      record the last --watch result as alerted
+# Tests: CHIEFOFSTAFF_USAGE_FIXTURE=<dir of *.json snapshots>, CHIEFOFSTAFF_NOW_MS=<epoch ms>.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+mode=text
+case "${1:-}" in
+  "") ;; --json) mode=json ;; --watch) mode=watch ;; --ack) mode=ack ;;
+  *) echo "usage: usage [--json|--watch|--ack]" >&2; exit 2 ;;
+esac
+state="${CHIEFOFSTAFF_STATE_DIR:-$HOME/.local/state/chiefofstaff}"; mkdir -p "$state"
+
+# A Node runtime: Orca's own (as bin/orca-account), else node.
+# ORCA_APP: the Orca install folder, when it isn't /opt/Orca or /Applications/Orca.app.
+app="${ORCA_APP:-}"; [ -n "$app" ] || { [ -d /opt/Orca ] && app=/opt/Orca; } || app=/Applications/Orca.app
+if [ -d "$app/resources" ]; then
+  orca_bin="$app/orca-ide"; res="$app/resources"
+else
+  orca_bin="$app/Contents/MacOS/Orca"; res="$app/Contents/Resources"
+fi
+export ORCA_CLIENT_JS="$res/app.asar.unpacked/out/cli/runtime/client.js"
+if [ -x "$orca_bin" ]; then runner=(env ELECTRON_RUN_AS_NODE=1 "$orca_bin" "$CHIEFOFSTAFF_DIR/bin/_usage.js")
+else runner=(node "$CHIEFOFSTAFF_DIR/bin/_usage.js"); fi
+# Each other machine's Orca environment name, for the switch commands the report prints.
+CHIEFOFSTAFF_ENVS=""
+for i in "${!OTHER_HOSTS[@]}"; do CHIEFOFSTAFF_ENVS+="${OTHER_HOSTS[$i]}=${OTHER_ENVS[$i]}"$'\n'; done
+export CHIEFOFSTAFF_HOST CHIEFOFSTAFF_ENVS
+# macOS has no GNU timeout; perl's alarm does the same.
+limit() { if command -v timeout >/dev/null; then timeout "$@"; else perl -e 'alarm shift; exec @ARGV' "$@"; fi; }
+
+if [ -n "${CHIEFOFSTAFF_USAGE_FIXTURE:-}" ]; then
+  snaps=("$CHIEFOFSTAFF_USAGE_FIXTURE"/*.json)
+else
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  # A caller's Orca session id only identifies it on its own host; paired servers refuse
+  # it (as in bin/lead-health), so the dumps run as nobody.
+  dump() {  # dump <host> <environment or empty> <out>
+    ( unset ORCA_AGENT_SESSION_ID ORCA_TERMINAL_HANDLE ORCA_AGENT_SESSION_SPAWN_TOKEN \
+        ORCA_STRUCTURED_SESSION ORCA_PAIRING_CODE
+      export ORCA_ENVIRONMENT="$2"
+      limit 40 "${runner[@]}" dump "$1" >"$3" 2>/dev/null ) && [ -s "$3" ] \
+      || echo "{\"host\":\"$1\",\"ok\":false,\"error\":\"Orca did not answer\"}" >"$3"
+  }
+  dump "$CHIEFOFSTAFF_HOST" "" "$tmp/0.json"
+  snaps=("$tmp/0.json")
+  for i in "${!OTHER_HOSTS[@]}"; do
+    dump "${OTHER_HOSTS[$i]}" "${OTHER_ENVS[$i]}" "$tmp/$((i+1)).json"
+    snaps+=("$tmp/$((i+1)).json")
+  done
+fi
+"${runner[@]}" report "$mode" "$state/usage.json" "${snaps[@]}"

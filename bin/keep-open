@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Keep leads' chats open after they finish, and confirm it from Orca's own accounting.
+#
+#   keep-open <dispatch>...   run worker-keep-open on each, then check that the Orca
+#                             holding its terminal (this machine's, or another machine's
+#                             for a lead started with --on) reports it "retained"
+#
+# Prints one line per dispatch: "kept open" (retained, and its terminal is alive), "already
+# closed" (released before this ran, or its terminal is gone), or "NOT kept open" with the
+# state Orca reports. Exit 0 when every dispatch is kept open, 1 otherwise.
+#
+# The Orca that coordinates the run records the retain and does the release, also for a
+# lead on another machine, whose own Orca doesn't track the dispatch. So worker-keep-open
+# answers "retained / no_owned_resource" for such a lead: retained here, no terminal owned
+# here. A retained record can outlive its terminal: a later dispatch in the same terminal
+# that wasn't kept open (a follow-up started without --keep-open) still closes it when it
+# finishes. Hence the liveness check against the machine that runs the terminal.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+
+[ $# -gt 0 ] || { sed -n '2,17p' "$0"; exit 2; }
+run="$(ledger_field Run)"
+[ -n "$run" ] || { echo "keep-open: no chiefofstaff run in ledger.md" >&2; exit 2; }
+
+for d in "$@"; do
+  orca_anon orchestration worker-keep-open --dispatch "$d" --json >/dev/null 2>&1 || true
+done
+states="$(lead_terminal_states "$run")" || { echo "keep-open: Orca can't list run $run's workers (worker-list --include-remote)" >&2; exit 1; }
+rc=0
+for d in "$@"; do
+  s="$(awk -v d="$d" '$1 == d { print $2; exit }' <<<"$states")"
+  if [ "$s" = retained ]; then
+    read -r term env_ < <(orca_anon orchestration worker-show --dispatch "$d" --full --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin).get("result") or {}
+except Exception:
+    r = {}
+h = (r.get("worker") or {}).get("agentTerminalHandle") or (r.get("terminal") or {}).get("handle") or "-"
+print(h, (r.get("server") or {}).get("name") or "-")') || true
+    if [ -n "${term:-}" ] && [ "$term" != - ]; then
+      if [ "$env_" = - ]; then where=(); else where=(--environment "$env_"); fi
+      # Orca keeps a closed terminal's record, with connected false. Chat-mode (structured)
+      # workers have no terminal Orca's terminal verbs accept; their retain record stands.
+      conn="$(orca_anon terminal show --terminal "$term" "${where[@]}" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    t = json.load(sys.stdin)["result"]["terminal"]
+    print("yes" if t.get("connected") else "no")
+except Exception:
+    print("unknown")')" || true
+      [ "$conn" != no ] || s=gone
+      case "$conn:$term" in unknown:term_*) s=unchecked ;; esac
+    fi
+  fi
+  case "$s" in
+    retained) echo "$d: kept open" ;;
+    unchecked) echo "$d: kept open in Orca's record, but its terminal $term couldn't be checked$([ "$env_" = - ] || echo " on $env_"): run this again"; rc=1 ;;
+    gone) echo "$d: already closed (Orca records it as kept open, but its terminal $term is gone)"; rc=1 ;;
+    -) echo "$d: already closed (Orca has no terminal for it)"; rc=1 ;;
+    "") echo "$d: NOT kept open: Orca doesn't list it in run $run"; rc=1 ;;
+    *) echo "$d: NOT kept open: Orca reports its terminal as $s"; rc=1 ;;
+  esac
+done
+exit $rc
