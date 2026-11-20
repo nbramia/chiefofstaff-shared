@@ -22,6 +22,12 @@ Chiefofstaff runs on one machine at a time; its run lives in that machine's Orca
 
 See `chiefofstaff.conf` → MACHINES.
 
+## Open cards
+
+One line per decision card put to the operator and not yet answered, removed when they
+answer: `- <project>: <the question in a few words> (asked YYYY-MM-DD)`. The scheduled
+sitrep mail carries these lines. None yet.
+
 ## Projects
 
 One entry per active project or admin thread, a few lines each: what it is, its lead and

@@ -278,6 +278,8 @@ function report(mode, statePath, files) {
   save({ alerted: settled, pending: { tier: worse ? r.tier : settled.tier, switches: [...new Set([...settled.switches, ...sigs])], thresholds: pendTh, pauses: pendP } });
   const lines = [...freshP.map(p => `Pause: ${pauseText(p)}`), ...overP.map(e => resumeLine(e, r)), ...freshTh.map(c => thresholdLine(c, r.switches))];
   if (lines.length) console.log(lines.join('\n'));
+  // A no-room switch entry that was already alerted isn't repeated in later alerts' reports.
+  r.switches = r.switches.filter(s => s.to || fresh.includes(`${s.host}|${s.kind}|${s.from}|${s.to}`));
   if (worse || fresh.length || lines.length) console.log(text(r, localHost));
 }
 

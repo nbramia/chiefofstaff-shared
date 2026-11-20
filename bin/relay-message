@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Optional hook: mail chiefofstaff's run a message the operator gave through another tool
+# (a voice capture, a phone shortcut, an email rule), so it reaches chiefofstaff as if typed
+# in its chat. Point that tool at this script; nothing else calls it.
+#
+#   relay-message [--via <source>] [--at <ISO time>] [message...]   the message from the
+#                                                                   args, else stdin
+#   --via   what it came through, shown in the subject ("voice capture"; default "relay")
+#   --at    when the operator said it (default: RELAY_RECORDED_AT, else now)
+#
+# Mails the run in ledger.md → Chiefofstaff run. When that run is on another machine, the
+# mail goes through that machine's paired Orca (--environment). Exits non-zero when nothing
+# was sent (empty message, no run in the ledger, Orca unreachable), so the calling tool can
+# keep the message and retry.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+at="${RELAY_RECORDED_AT:-}"; via="relay"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --at) at="${2:?--at needs a time}"; shift 2 ;;
+    --via) via="${2:?--via needs a name}"; shift 2 ;;
+    *) break ;;
+  esac
+done
+if [ $# -gt 0 ]; then msg="$*"; else msg="$(cat)"; fi
+[ -n "${msg//[[:space:]]/}" ] || { echo "relay-message: empty message, nothing sent" >&2; exit 2; }
+
+chiefofstaff_pull 2>/dev/null || true
+host="$(ledger_field Host)"; run="$(ledger_field Run)"
+[ -n "$run" ] || { echo "relay-message: no chiefofstaff run in ledger.md" >&2; exit 1; }
+if [ "$host" = "$CHIEFOFSTAFF_HOST" ]; then where=()
+else
+  env="$(machine_field "$host" env)"
+  [ -n "$env" ] || { echo "relay-message: ledger.md names a machine that isn't in MACHINES: '$host'" >&2; exit 1; }
+  where=(--environment "$env")
+fi
+
+# When it was said, in this machine's zone, e.g. "Thu 19 Nov, 14:05 EST"; now if unknown.
+when="$(python3 - "$at" <<'PY'
+import sys
+from datetime import datetime
+raw = sys.argv[1]
+try:
+    t = datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else datetime.now().astimezone()
+    print(t.astimezone().strftime("%a %-d %b, %H:%M %Z"))
+except ValueError:
+    print(raw)
+PY
+)"
+
+subject="Relayed from $OPERATOR_NAME via $via ($when)"
+body="$OPERATOR_NAME, through $via at $when. Relayed messages are often spoken, so words may be misheard:
+
+$msg
+
+This is $OPERATOR_NAME talking to you. Follow AGENTS.md → Relayed messages: echo back what you heard, then act on it as on any message from them."
+# ${where[@]+...}: bash 3.2 (macOS) treats an empty array as unset under set -u.
+orca_anon orchestration send --to "run:$run" --from operator-relay --type status \
+  --subject "$subject" --body "$body" ${where[@]+"${where[@]}"} >/dev/null

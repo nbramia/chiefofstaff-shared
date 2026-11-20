@@ -3,11 +3,13 @@
 # (systemd on Linux, launchd on macOS); it only acts on the machine the ledger says
 # chiefofstaff runs on.
 #
-#   sitrep-ping [sitrep]   scheduled sitrep, with bin/lead-health's and bin/usage's reports
+#   sitrep-ping [sitrep]   scheduled sitrep, with the ledger's open cards and bin/lead-health's
+#                          and bin/usage's reports
 #   sitrep-ping watch      every 15 min: mail only if bin/lead-health --watch found a new
 #                          problem or bin/usage --watch advises a change (including the 95%
 #                          pause starting or ending); `Threshold:` lines (80%/90% of a window)
-#                          also go to NOTIFY_CMD (chiefofstaff.conf), if set
+#                          also go to NOTIFY_CMD (chiefofstaff.conf), if set; and "Follow-up
+#                          due" for each bin/follow-up whose time has passed (once each)
 #   sitrep-ping retro      weekly: start a retrospective (AGENTS.md → Retrospectives), with
 #                          bin/open-work's list of open workspaces and lead chats for review
 set -euo pipefail
@@ -30,6 +32,9 @@ case "$mode" in
     subject="Scheduled sitrep"
     body="Scheduled sitrep. Check Orca state and the ledger, then post the four-group update in this chat. If nothing changed since the last update, say so in one line. Any STALLED lead below goes under Broken.
 
+Open cards (ledger → Open cards; each gets one 'still open' line under Blocked on you, not the full card):
+$(ledger_open_cards | grep . || echo "(none)")
+
 $(health)
 
 Usage (AGENTS.md → Usage and models):
@@ -38,11 +43,20 @@ $(usage)" ;;
     report="$("$CHIEFOFSTAFF_DIR/bin/lead-health" --watch)"
     # A failed usage check must not ack an earlier, unsent alert.
     uok=1; ureport="$("$CHIEFOFSTAFF_DIR/bin/usage" --watch 2>&1)" || { uok=""; ureport=""; }
-    [ -n "$report" ] || [ -n "$ureport" ] || exit 0
+    freport="$("$CHIEFOFSTAFF_DIR/bin/follow-up" --due 2>&1 || true)"
+    [ -n "$report" ] || [ -n "$ureport" ] || [ -n "$freport" ] || exit 0
     subject="" body=""
+    if [ -n "$freport" ]; then
+      subject="Follow-up due"
+      body="A follow-up you set with bin/follow-up is due. Do what it says now.
+
+$freport"
+    fi
     if [ -n "$report" ]; then
-      subject="Lead health alert"
-      body="bin/lead-health found a new problem. Look into it now (AGENTS.md → Lead health) and tell $OPERATOR_NAME under Broken.
+      subject="${subject:+$subject + }Lead health alert"
+      body="${body:+$body
+
+}bin/lead-health found a new problem. Look into it now (AGENTS.md → Lead health) and tell $OPERATOR_NAME under Broken.
 
 $report"
     fi
@@ -78,5 +92,9 @@ fi
 # Only now count the watch problems as alerted; if a send failed, the next run retries.
 if [ "$mode" = watch ]; then
   "$CHIEFOFSTAFF_DIR/bin/lead-health" --ack
+  # Only the follow-ups this mail named: one that fell due since --due fires next time.
+  fids="$(grep -oE '\(f[0-9]+, set ' <<<"$freport" | grep -oE 'f[0-9]+' || true)"
+  # shellcheck disable=SC2086
+  [ -z "$fids" ] || "$CHIEFOFSTAFF_DIR/bin/follow-up" --ack $fids || true
   [ -z "$uok" ] || [ -z "$tok" ] || "$CHIEFOFSTAFF_DIR/bin/usage" --ack || true
 fi
