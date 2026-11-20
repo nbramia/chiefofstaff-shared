@@ -13,6 +13,9 @@
 # with bin/keep-open that Orca will leave the chat open when it finishes, and prints the new
 # dispatch id: record it in the ledger. On another machine, do the receipt check next
 # (AGENTS.md → Leads).
+# Refuses (exit 1) when the chat still has an open dispatch in the run. After starting, reads
+# the new dispatch back: the last line says STARTED, or NOT SENT (exit 1, Orca failed it), or
+# NOT CONFIRMED (exit 3, no answer yet: check worker-show before saying it was sent).
 set -euo pipefail
 . "$(dirname "$0")/_common.sh"
 
@@ -27,7 +30,7 @@ while [ $# -gt 0 ]; do
     --title) title="$2"; shift 2 ;;
     --dry-run) dry=1; shift ;;
     ctx_*) dispatch="$1"; shift ;;
-    *) sed -n '2,15p' "$0"; exit 2 ;;
+    *) sed -n '2,18p' "$0"; exit 2 ;;
   esac
 done
 [ ${#spec[@]} -gt 0 ] || { echo "lead-continue: give --spec-file or --spec" >&2; exit 2; }
@@ -55,6 +58,23 @@ fi
 
 run="$(ledger_field Run)"
 [ -n "$run" ] || { echo "lead-continue: no chiefofstaff run in ledger.md" >&2; exit 2; }
+# A chat with an open dispatch takes no second one: Orca accepts the start, then fails it
+# ("already has an active dispatch"), and the work never arrives.
+open_in_chat="$(run_workers "$run" 2>/dev/null | python3 -c '
+import json, sys
+term = sys.argv[1]
+for l in sys.stdin:
+    w = json.loads(l)
+    if w.get("terminal") == term and w.get("outcome") == "in_progress":
+        print(w.get("dispatchId")); break' "$terminal" || true)"
+if [ -n "$open_in_chat" ]; then
+  echo "lead-continue: this chat still has an open dispatch, $open_in_chat; a second one would fail." >&2
+  echo "  Send the work to it (orca orchestration send --to dispatch:$open_in_chat), or stop it" >&2
+  echo "  (worker-stop --dispatch $open_in_chat) and run lead-continue again." >&2
+  echo "lead-continue: NOT SENT. Don't tell $OPERATOR_NAME it was sent." >&2
+  exit 1
+fi
+
 # --keep-open: a reused terminal is closed when this dispatch finishes unless this dispatch
 # is kept open, even if earlier dispatches in it were (AGENTS.md → Leads, Keep open).
 cmd=("$ORCA" orchestration worker-start --run "$run" --terminal "$terminal" --worktree "$worktree"
@@ -62,12 +82,53 @@ cmd=("$ORCA" orchestration worker-start --run "$run" --terminal "$terminal" --wo
 [ -z "$on" ] || cmd+=(--on "$on")
 [ -z "$title" ] || cmd+=(--task-title "$title")
 if [ -n "$dry" ]; then printf 'would run:'; printf ' %q' "${cmd[@]}"; echo; exit 0; fi
-out="$("${cmd[@]}" 2>&1)" || { echo "lead-continue: worker-start failed:" >&2; echo "$out" >&2; exit 1; }
+out="$("${cmd[@]}" 2>&1)" || { echo "lead-continue: worker-start failed:" >&2; echo "$out" >&2
+  echo "lead-continue: NOT SENT. Don't tell $OPERATOR_NAME it was sent." >&2; exit 1; }
 echo "$out"
 new="$(grep -oE 'ctx_[0-9a-f]{12}' <<<"$out" | head -1 || true)"
+# Orca can accept the start and fail it a moment later, so read the new dispatch back
+# until it shows the work was taken (stage input_accepted) or failed.
+started=""
+if [ -n "$new" ]; then
+  tries="${LEAD_CONTINUE_TRIES:-10}"; last=""
+  for ((i = 1; i <= tries; i++)); do
+    [ "$i" = 1 ] || sleep "${LEAD_CONTINUE_WAIT:-3}"
+    last="$("$ORCA" orchestration worker-show --dispatch "$new" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin).get("result") or {}
+except Exception:
+    sys.exit()
+state, stage = r.get("state") or "", r.get("stage") or ""
+err = (r.get("lastError") or "").replace("\n", " ")
+if state in ("failed", "stopped", "abandoned", "cancelled") or "failure" in (r.get("attention") or []):
+    print("failed", f"state={state} stage={stage}" + (f": {err}" if err else ""))
+elif stage in ("input_accepted", "settled") or state in ("running", "succeeded"):
+    print("started", f"state={state} stage={stage}")
+else:
+    print("pending", f"state={state} stage={stage}")' || true)"
+    case "$last" in failed*|started*) break ;; esac
+  done
+  case "$last" in
+    failed*)
+      echo "lead-continue: Orca failed dispatch $new (${last#failed }). Read worker-show --dispatch $new." >&2
+      echo "lead-continue: NOT SENT. Don't tell $OPERATOR_NAME it was sent." >&2
+      exit 1 ;;
+    started*) started=1 ;;
+  esac
+fi
 echo "lead-continue: ${new:-new dispatch} in terminal $terminal${on:+ on $on}. Record it in the ledger."
+# Mail sent to the old dispatch never reached it; this dispatch's spec carries the work now.
+[ -z "$dispatch" ] || "$CHIEFOFSTAFF_DIR/bin/lead-health" --dismiss "$dispatch" >/dev/null 2>&1 || true
 if [ -n "$new" ]; then
   "$CHIEFOFSTAFF_DIR/bin/keep-open" "$new" \
     || echo "  Orca hasn't confirmed it will stay open: run bin/keep-open $new again, and tell $OPERATOR_NAME under Broken if it still fails." >&2
 fi
 [ -z "$on" ] || echo "  It runs on $on: send the receipt check now (AGENTS.md → Leads)."
+if [ -n "$started" ]; then
+  echo "lead-continue: STARTED $new: Orca shows it took the work."
+else
+  echo "lead-continue: NOT CONFIRMED: Orca hasn't shown that ${new:-the new dispatch} took the work (${last:-no dispatch id or no answer})." >&2
+  echo "  Check worker-show --dispatch ${new:-<id>} before telling $OPERATOR_NAME it was sent." >&2
+  exit 3
+fi

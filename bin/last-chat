@@ -38,8 +38,12 @@ def from_operator(t):  # not tool output, task notices, Orca mail or command wra
     t = t.strip()
     return t and not t.startswith(("<", "────", "[Request interrupted", "Caveat:"))
 
-for f in files[:5]:  # newest previous session that has a reply in it
+# Orca names each chat with a side session whose first message is this prompt.
+TITLE_PROMPT = "Name this chat from the user's first request"
+
+for f in files[:8]:  # newest previous session that has a reply in it
     said = asked = None
+    first = True
     for line in open(f, errors="replace"):
         try:
             e = json.loads(line)
@@ -52,6 +56,10 @@ for f in files[:5]:  # newest previous session that has a reply in it
             if t:
                 said = (e.get("timestamp"), t)
         elif e.get("type") == "user":
+            if first and any(x.strip().startswith(TITLE_PROMPT) for x in texts(e)):
+                said = None
+                break
+            first = False
             t = "\n".join(x for x in texts(e) if from_operator(x))
             if t:
                 asked = (e.get("timestamp"), t)

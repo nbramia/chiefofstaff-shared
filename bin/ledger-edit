@@ -5,16 +5,20 @@
 #   ledger-edit '<old text>' '<new text>'     replace; <old text> must occur exactly once
 #   ledger-edit --append '<project>' '<text>' add a sentence to the end of the
 #                                             "- **<project>**" entry under ## Projects
+#   ledger-edit --set '<project>' '<text>'    replace the whole "- **<project>**" entry
+#                                             with "- **<project>**: <text>" (or with <text>
+#                                             as given when it starts "- **<project>**")
 #
 # Prints the edited entry or line. Exit 1 on no match, several matches, or no change.
-# Warns when a project entry is over the length limit (ledger_long_entries in _common.sh).
+# Warns when a project entry is over the length limit (ledger_long_entries in _common.sh);
+# --set warns only about the entry it wrote.
 # Pull before and commit + push after, as AGENTS.md says.
 set -euo pipefail
 . "$(dirname "$0")/_common.sh"
-[ $# -eq 2 ] || [ $# -eq 3 ] || { sed -n '2,11p' "$0"; exit 2; }
-python3 - "$LEDGER" "$@" <<'PY'
+[ $# -eq 2 ] || [ $# -eq 3 ] || { sed -n '2,15p' "$0"; exit 2; }
+python3 - "$LEDGER" "${LEDGER_ENTRY_WORDS:-120}" "$@" <<'PY'
 import re, sys
-path, args = sys.argv[1], sys.argv[2:]
+path, limit, args = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
 s = open(path).read()
 def die(msg):
     print(f"ledger-edit: {msg}; ledger.md unchanged", file=sys.stderr); sys.exit(1)
@@ -27,6 +31,22 @@ if args[0] == "--append":
     new_line = m.group(0).rstrip() + " " + text
     out = s[:m.start()] + new_line + s[m.end():]
     shown = new_line
+elif args[0] == "--set":
+    if len(args) != 3: die("--set needs <project> <text>")
+    proj, text = args[1], args[2].strip()
+    if "\n" in text: die("--set text must be one line")
+    head = "- **" + proj + "**"
+    # An entry runs on through its indented continuation lines.
+    entries = list(re.finditer(r"^- \*\*" + re.escape(proj) + r"\*\*.*(?:\n[ \t]+\S.*)*", s, flags=re.M))
+    if len(entries) != 1:
+        lines = ", ".join(str(s.count("\n", 0, m.start()) + 1) for m in entries)
+        die(f"found {len(entries)} entries for '{proj}'" + (f" (lines {lines})" if lines else ""))
+    m = entries[0]
+    new_line = text if text.startswith(head) else f"{head}: {text}"
+    out = s[:m.start()] + new_line + s[m.end():]
+    shown = new_line
+    if len(new_line.split()) > limit:
+        print(f"ledger-edit: {proj} is {len(new_line.split())} words, over {limit}; cut it to current state (what it is, lead and dispatch, what waits on whom), history stays in git", file=sys.stderr)
 else:
     if len(args) != 2: die("give <old text> <new text>")
     old, new = args
@@ -38,6 +58,7 @@ if out == s: die("no change")
 open(path, "w").write(out)
 print(shown)
 PY
+[ "$1" != --set ] || exit 0
 long="$(ledger_long_entries)"
 if [ -n "$long" ]; then
   echo "ledger-edit: entries over ${LEDGER_ENTRY_WORDS:-120} words; cut them to current state (what it is, lead and dispatch, what waits on whom), history stays in git:" >&2

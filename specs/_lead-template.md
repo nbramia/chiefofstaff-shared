@@ -9,6 +9,10 @@ contact. You own this work in this repo: how it gets done is your call.
 context or constraints they gave, each marked as theirs. Nothing chiefofstaff made up: no
 extra requirements, acceptance criteria, approach or limits.>
 
+Output: <for writing or other deliverables, who it's for and what form (executive plan,
+research note, working doc), from the operator's words; or "unknown: ask before writing
+it". Leave this line out for code changes.>
+
 ## How to work
 
 - Follow this repo's `AGENTS.md` and conventions, and the operator's global instructions.
@@ -26,6 +30,12 @@ extra requirements, acceptance criteria, approach or limits.>
 - If what the operator asked for is unclear, or the right scope is a judgment call they'd
   want to make, ask before building: send a `question` (or `decision_gate`) with the
   options and your recommendation.
+- When you state a default you'll take if nobody answers, say when ("if no answer by
+  14:00 I'll go with B"), and at that time take it and carry on without waiting to be told.
+  Only reversible choices get a default, never anything under Ask before you.
+- If the work needs a particular machine or device (a build on another machine, a phone, a
+  printer), check first that you can reach it, before writing work that depends on it. If
+  you can't, say so at once (an escalation) and do what you can without it.
 
 ## Questions for the operator
 

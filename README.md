@@ -82,7 +82,7 @@ Files you own, written for you and kept in your private copy:
 |---|---|
 | `chiefofstaff.conf` | Your machines, paths, GitHub owner, notify command and schedule (from `chiefofstaff.conf.example`) |
 | `operator.md` | How you work: machines and accounts, updates, approvals, what never to do, how leads work (from `templates/operator.md`) |
-| `ledger.md` | Chiefofstaff's current state: standing guidance, its Orca run, projects, open decisions (from `templates/ledger.md`) |
+| `ledger.md` | Chiefofstaff's current state: standing guidance, its Orca run, the open cards put to you and not yet answered, projects, open decisions (from `templates/ledger.md`). Entries point to PRs, issues and notes rather than restating them; `bin/ledger-edit` edits it and fails loudly when its target isn't there (`--set` rewrites one whole entry by name) |
 | `specs/<project>.md` | One spec per lead, written from `specs/_lead-template.md` |
 | `retros/` | Chiefofstaff's weekly retrospectives |
 
@@ -212,8 +212,8 @@ only if the ledger's Host is this machine, so exactly one chiefofstaff wakes.
 
 | Job | When (default) | Mails chiefofstaff |
 |---|---|---|
-| `sitrep` | 08:30, 12:30, 17:30 | "Scheduled sitrep", with `bin/lead-health`'s and `bin/usage`'s reports |
-| `watch` | every 15 min | "Lead health alert" when `bin/lead-health --watch` finds a new problem; "Usage alert" when `bin/usage --watch` finds the tier worse, new switch advice, a threshold crossing, or a pause starting or ending |
+| `sitrep` | 08:30, 12:30, 17:30 | "Scheduled sitrep", with the ledger's open cards and `bin/lead-health`'s and `bin/usage`'s reports |
+| `watch` | every 15 min | "Follow-up due" for each `bin/follow-up` whose time has passed (once each, on the next run after the machine comes back if it was off); "Lead health alert" when `bin/lead-health --watch` finds a new problem; "Usage alert" when `bin/usage --watch` finds the tier worse, new switch advice, a threshold crossing, or a pause starting or ending |
 | `retro` | Sundays 16:00 | "Scheduled retrospective", with `bin/open-work`'s list of open workspaces and lead chats for the weekly cleanup review |
 
 `bin/lead-health` lists each active lead in chiefofstaff's run as `ok` or `STALLED`, with
@@ -223,9 +223,27 @@ STALLED means Orca can't observe the lead's process, it's parked on a prompt
 either, or it's on another machine whose inbox can't be read. Each lead's line shows its
 last words, and an `ok` lead quiet for 10 minutes gets a verdict: `waiting` (on a worker,
 build, review, you or chiefofstaff, or its own open question) or `idle` (ended its turn
-and waits on nothing). Unread mail to a finished lead shows as `UNSENT`. An active lead
-Orca would close when it finishes is kept open on the spot. The watch job counts a
-problem as alerted only after its mail went out, so a failed send is retried.
+and waits on nothing). Unread mail to a finished lead shows as `UNSENT` until it is resent
+or dismissed (`--dismiss <msg or dispatch>`). A machine whose Orca doesn't answer (asleep
+or off) is one `OFFLINE` note naming its leads, with no alert. A task Orca still lists as
+open whose worker finished shows as done. An active lead Orca would close when it finishes
+is kept open on the spot. The watch job counts a problem as alerted only after its mail
+went out, so a failed send is retried.
+
+`bin/follow-up "<when>" "<note>"` (`+30m`, `+2h`, `+1d`, `HH:MM`, `YYYY-MM-DD [HH:MM]`) is
+how chiefofstaff sets itself a time to come back to something; `--list` and `--cancel <id>`
+manage them. They live in `~/.local/state/chiefofstaff/follow-ups.json` on the machine that
+set them, so one set before chiefofstaff moves machines stays behind: check `--list` there.
+The watch drops each follow-up only after its mail went out, so a failed send retries.
+
+### Relayed messages
+
+Optional. `bin/relay-message [--via <source>] [--at <time>] [message]` mails chiefofstaff's
+run a message from you that came through another tool: point a voice-capture app, a phone
+shortcut or a mail rule at it (message on stdin or as arguments). It finds the run from the
+ledger, goes through the paired Orca when chiefofstaff runs on another machine, and exits
+non-zero when nothing was sent, so the calling tool can retry. Chiefofstaff echoes back
+what it heard before acting (`AGENTS.md` → Relayed messages).
 
 After changing the schedule, rerun `bin/install-timers`. `bin/install-timers --remove`
 takes the jobs off a machine.
@@ -263,7 +281,9 @@ closes on its own. Cleanup happens in a weekly review with you: the retrospectiv
 carries `bin/open-work`, every workspace on every machine that isn't a main checkout, with
 its branch, PR, last activity, chats and chiefofstaff leads, marked `close?` when nothing
 is working there and the PR is merged or closed or it has been idle 7 days. Chiefofstaff
-closes what you pick (`AGENTS.md` → Closing a project).
+closes what you pick (`AGENTS.md` → Closing a project). The exception is an ask you call a
+one-off: chiefofstaff closes that lead's chat and workspace itself once it has relayed the
+result.
 
 ## Permissions
 
@@ -277,9 +297,11 @@ external or ambiguous. `bin/lead-health` finds leads parked on prompts.
 
 `tests/run.sh` checks the scripts offline against a fake `orca` and a test configuration
 with two machines: syntax, configuration loading, the ledger helpers and
-`bin/ledger-edit`, `bin/lead-health`'s verdicts and alert de-duplication,
-`bin/lead-continue`, `bin/keep-open`, `bin/open-work`, `bin/last-chat`, `ensure-project`
-reporting an Orca refusal, `bin/usage`'s pace, tiers, switch advice, thresholds and pauses
+`bin/ledger-edit`, `bin/lead-health`'s verdicts, offline notes, dismissals and alert
+de-duplication, `bin/lead-continue` and its check that a follow-up started, `bin/lead-move`,
+`bin/keep-open`, `bin/open-work` (including listings too large for an argument),
+`bin/follow-up` and the watch mailing each due one once, the sitrep mail's open cards,
+`bin/relay-message`, `bin/last-chat`, `ensure-project` reporting an Orca refusal, `bin/usage`'s pace, tiers, switch advice, thresholds and pauses
 (on fixture snapshots), `sitrep-ping`'s three jobs acting only on chiefofstaff's machine,
 `bin/install-timers`' units, `start-chiefofstaff` refusing in a worktree, skill
 frontmatter, and that every path the docs mention exists. When `orca` and `gh` work and
@@ -301,7 +323,14 @@ machines, and real repo creation, because each changes live state.
   `dispatch_inactive`, and on another machine a `reply` to its `worker_done` is accepted
   but never delivered. `bin/lead-continue <dispatch> --spec-file <file>` starts a
   follow-up dispatch in the same chat, keeping its session and context; with `--terminal`
-  and `--worktree` it adopts any existing chat as a lead.
+  and `--worktree` it adopts any existing chat as a lead. Orca can accept a start and fail
+  it a moment later (a chat with a dispatch still open takes no second one), so it refuses
+  a chat with an open dispatch in chiefofstaff's run, then reads the new dispatch back: its
+  last line is `STARTED`, `NOT SENT` (exit 1) or `NOT CONFIRMED` (exit 3).
+- Orca can't move a chat to another workspace, and an account switch can leave a lead's
+  terminal with no agent. `bin/lead-move <dispatch> --repo <selector> (--spec-file <f> |
+  --spec <text>)` starts a fresh kept-open lead in a new workspace of that repo, told to
+  read the old one's transcript first.
 - Messages to a lead on another machine can fail silently when the two Orca apps run
   different versions: `send` says `queuedFor=worker`, the mail sits unhandled in the
   other machine's inbox, and `worker-show` reports `observation.status:

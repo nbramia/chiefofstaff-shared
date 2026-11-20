@@ -28,11 +28,11 @@ export CHIEFOFSTAFF_CONFIG="$tmp/test.conf" CHIEFOFSTAFF_MACHINE=desktop
 unset CHIEFOFSTAFF_NOTIFY
 
 echo "syntax"
-for f in bin/_common.sh bin/start-chiefofstaff bin/sitrep-ping bin/ensure-project bin/orca-account bin/lead-health bin/ledger-edit bin/usage bin/lead-continue bin/last-chat bin/keep-open bin/open-work bin/install-timers tests/run.sh; do
+for f in bin/_common.sh bin/start-chiefofstaff bin/sitrep-ping bin/ensure-project bin/orca-account bin/lead-health bin/ledger-edit bin/usage bin/lead-continue bin/last-chat bin/keep-open bin/open-work bin/install-timers bin/lead-move bin/follow-up bin/relay-message tests/run.sh; do
   bash -n "$f" 2>"$tmp/err" && ok "bash -n $f" || bad "bash -n $f" "$(cat "$tmp/err")"
 done
 if command -v shellcheck >/dev/null; then
-  shellcheck -S error bin/_common.sh bin/start-chiefofstaff bin/sitrep-ping bin/ensure-project bin/lead-health bin/ledger-edit bin/usage bin/lead-continue bin/last-chat bin/keep-open bin/open-work bin/install-timers >"$tmp/sc" 2>&1 \
+  shellcheck -S error bin/_common.sh bin/start-chiefofstaff bin/sitrep-ping bin/ensure-project bin/lead-health bin/ledger-edit bin/usage bin/lead-continue bin/last-chat bin/keep-open bin/open-work bin/install-timers bin/lead-move bin/follow-up bin/relay-message >"$tmp/sc" 2>&1 \
     && ok "shellcheck (errors)" || bad "shellcheck (errors)" "$(head -20 "$tmp/sc")"
 else skip "shellcheck not installed"; fi
 
@@ -108,6 +108,26 @@ LEDGER_ENTRY_WORDS=7 le --append beta 'Five six seven.' >/dev/null 2>"$tmp/err";
   && ok "warns when an edit leaves an entry over the limit" || bad "ledger-edit length warning" "rc=$rc $(cat "$tmp/err")"
 out="$(CHIEFOFSTAFF_LEDGER="$tmp/le.md" LEDGER_ENTRY_WORDS=7 bash -c '. bin/_common.sh; ledger_long_entries')"
 grep -qx "beta: [0-9]* words" <<<"$out" && ok "ledger_long_entries lists only long project entries" || bad "ledger_long_entries" "got: $out"
+LEDGER_ENTRY_WORDS=7 le --set alpha 'all new.' >/dev/null 2>"$tmp/err"; rc=$?
+{ [ $rc = 0 ] && grep -qx -- '- \*\*alpha\*\*: all new\.' "$tmp/le.md" && grep -q '^- \*\*beta\*\*: two\.' "$tmp/le.md" && [ ! -s "$tmp/err" ]; } \
+  && ok "--set replaces one whole entry, no warning about other long entries" || bad "ledger-edit --set" "rc=$rc $(cat "$tmp/err") $(cat "$tmp/le.md")"
+le --set alpha '- **alpha** (started y): kept form.' >/dev/null && grep -qx -- '- \*\*alpha\*\* (started y): kept form\.' "$tmp/le.md" \
+  && ok "--set keeps text that starts with the entry's name as given" || bad "ledger-edit --set full line" "$(grep alpha "$tmp/le.md")"
+LEDGER_ENTRY_WORDS=7 le --set alpha 'one two three four five six seven eight.' >/dev/null 2>"$tmp/err"; rc=$?
+{ [ $rc = 0 ] && grep -q 'alpha is 10 words, over 7' "$tmp/err" && ! grep -q beta "$tmp/err"; } \
+  && ok "--set warns only about the entry it wrote" || bad "ledger-edit --set warning" "rc=$rc $(cat "$tmp/err")"
+printf -- '- **delta**: first line\n  continued here.\n- **epsilon**: after.\n' >> "$tmp/le.md"
+le --set delta 'one line now.' >/dev/null && grep -qx -- '- \*\*delta\*\*: one line now\.' "$tmp/le.md" \
+  && ! grep -q 'continued here' "$tmp/le.md" && grep -qx -- '- \*\*epsilon\*\*: after\.' "$tmp/le.md" \
+  && ok "--set replaces an entry's continuation lines too" || bad "ledger-edit --set multi-line" "$(tail -4 "$tmp/le.md")"
+cp "$tmp/le.md" "$tmp/le.bak"
+le --set gamma 'x' 2>"$tmp/err"; rc=$?
+{ [ $rc = 1 ] && grep -q "found 0 entries for 'gamma'" "$tmp/err" && cmp -s "$tmp/le.md" "$tmp/le.bak"; } \
+  && ok "--set refuses an unknown entry, changes nothing" || bad "ledger-edit --set unknown" "rc=$rc $(cat "$tmp/err")"
+printf -- '- **beta**: a duplicate.\n' >> "$tmp/le.md"; cp "$tmp/le.md" "$tmp/le.bak"
+le --set beta 'x' 2>"$tmp/err"; rc=$?
+{ [ $rc = 1 ] && grep -q "found 2 entries for 'beta' (lines" "$tmp/err" && cmp -s "$tmp/le.md" "$tmp/le.bak"; } \
+  && ok "--set refuses a name with two entries, changes nothing" || bad "ledger-edit --set duplicate" "rc=$rc $(cat "$tmp/err")"
 
 echo "last-chat"
 tr="$tmp/transcripts"; mkdir -p "$tr"
@@ -124,6 +144,13 @@ out="$(CHIEFOFSTAFF_TRANSCRIPTS="$tr" CLAUDE_CODE_SESSION_ID=cur-session bin/las
 { grep -q 'Previous chat on .*: old-sess' <<<"$out" && grep -q 'Where is webapp at' <<<"$out" \
   && grep -q "Sam's last message" <<<"$out" && grep -q '1. webapp: A or B' <<<"$out" && ! grep -q 'From: dispatch\|subagent noise' <<<"$out"; } \
   && ok "shows the previous chat's last exchange, skipping this session and noise" || bad "last-chat" "$out"
+jl '{"type":"user","timestamp":"2026-11-08T20:30:00Z","message":{"content":"Name this chat from the user'"'"'s first request.\nWrite a short title.\n\nFirst request:\nWhere is webapp at?"}}' \
+   '{"type":"assistant","timestamp":"2026-11-08T20:30:01Z","message":{"content":[{"type":"text","text":"Webapp status check"}]}}' \
+   > "$tr/title-session.jsonl"
+python3 -c 'import os,sys,time; t=time.time()-1800; os.utime(sys.argv[1], (t, t))' "$tr/title-session.jsonl"
+out="$(CHIEFOFSTAFF_TRANSCRIPTS="$tr" CLAUDE_CODE_SESSION_ID=cur-session bin/last-chat)"
+{ grep -q 'Previous chat on .*: old-sess' <<<"$out" && ! grep -q 'Webapp status check' <<<"$out"; } \
+  && ok "skips Orca's chat-title side session" || bad "last-chat title session" "$out"
 out="$(CHIEFOFSTAFF_TRANSCRIPTS="$tmp/none" bin/last-chat)"
 grep -q 'no chiefofstaff transcripts' <<<"$out" && ok "says so when there are no transcripts" || bad "last-chat empty" "$out"
 
@@ -249,6 +276,71 @@ p = sys.argv[1]; s = json.load(open(p)); s["seen"]["m9"] = time.time() - 25 * 36
 EOF
 out="$(lh)"; rc=$?
 [ $rc = 0 ] && ok "stops flagging finished-lead mail after a day" || bad "lead-health finished-lead mail expiry" "rc=$rc $out"
+# Resent mail can be dismissed, by message or by dispatch (mail so far to it).
+fj inbox '{"ok":true,"result":[{"id":"msg_a1","type":"status","to":"dispatch:ctx_done","handled":false,"subject":"one"}]}'
+lh --dismiss msg_a1 >/dev/null; out="$(lh)"; rc=$?
+{ [ $rc = 0 ] && ! grep -q UNSENT <<<"$out"; } && ok "--dismiss <msg> silences that UNSENT line" || bad "lead-health dismiss msg" "rc=$rc $out"
+fj inbox '{"ok":true,"result":[{"id":"msg_a1","type":"status","to":"dispatch:ctx_done","handled":false,"subject":"one"},{"id":"msg_a2","type":"status","to":"dispatch:ctx_done","handled":false,"subject":"two"}]}'
+out="$(lh)"; { grep -q 'UNSENT .*msg_a2' <<<"$out" && ! grep -q msg_a1 <<<"$out"; } \
+  && ok "other UNSENT mail still shows" || bad "lead-health dismiss too broad" "$out"
+lh --dismiss ctx_done >/dev/null; out="$(lh)"; rc=$?
+{ [ $rc = 0 ] && ! grep -q UNSENT <<<"$out"; } && ok "--dismiss <dispatch> silences mail so far to it" || bad "lead-health dismiss dispatch" "rc=$rc $out"
+fj inbox '{"ok":true,"result":[{"id":"msg_a3","type":"status","to":"dispatch:ctx_done","handled":false,"subject":"three"}]}'
+out="$(lh)"; grep -q 'UNSENT .*msg_a3' <<<"$out" && ok "mail sent after a dispatch was dismissed is flagged" || bad "lead-health dismiss future mail" "$out"
+fj inbox '{"ok":true,"result":[{"id":"msg_c1","type":"status","to":"dispatch:ctx_c","handled":false,"subject":"x"}]}'
+fj worker-show-ctx_c '{"ok":true,"result":{"dispatch":{"runId":"run_dddddddddddd","taskId":"t3","status":"completed"}}}'
+lh --dismiss ctx_c >/dev/null; out="$(lh)"; ! grep -q 'msg_c1' <<<"$out" \
+  && ok "--dismiss <dispatch> covers mail lead-health hadn't seen yet" || bad "lead-health dismiss unseen" "$out"
+rm -f "$FAKE/worker-show-ctx_c.json"
+# Mail relayed to a paired machine has relay_ ids; they dismiss the same way.
+fj inbox-lap '{"ok":true,"result":[{"id":"relay_d1","type":"status","to":"dispatch:ctx_done","handled":false,"subject":"Receipt check"}]}'
+fj inbox '{"ok":true,"result":[]}'
+out="$(lh)"; grep -q 'UNSENT .*relay_d1' <<<"$out" || bad "lead-health relay mail not flagged" "$out"
+lh --dismiss relay_d1 >/dev/null; out="$(lh)"; ! grep -q relay_d1 <<<"$out" \
+  && ok "--dismiss <relay_ id> silences relayed mail" || bad "lead-health dismiss relay" "$out"
+# A dispatch dismissed while another machine's inbox can't be read covers its mail there
+# when that inbox comes back, though lead-health first sees it later.
+fj worker-show-ctx_e '{"ok":true,"result":{"dispatch":{"runId":"run_dddddddddddd","taskId":"t3","status":"completed"}}}'
+mv "$FAKE/inbox-lap.json" "$FAKE/inbox-lap.off"
+lh --dismiss ctx_e >/dev/null
+mv "$FAKE/inbox-lap.off" "$FAKE/inbox-lap.json"
+fj inbox-lap '{"ok":true,"result":[{"id":"relay_e1","type":"status","to":"dispatch:ctx_e","handled":false,"subject":"Receipt check"}]}'
+out="$(lh)"; ! grep -q relay_e1 <<<"$out" \
+  && ok "--dismiss <dispatch> covers an inbox it couldn't read at the time" || bad "lead-health dismiss unreadable inbox" "$out"
+rm -f "$FAKE/worker-show-ctx_e.json"; fj inbox-lap '{"ok":true,"result":[]}'
+lh --dismiss nonsense 2>/dev/null; [ $? = 2 ] && ok "--dismiss refuses something that isn't an id" || bad "lead-health dismiss bad id"
+# Mail in another machine's inbox keeps its age while that inbox can't be read.
+fj inbox '{"ok":true,"result":[]}'
+fj inbox-lap '{"ok":true,"result":[{"id":"msg_b1","type":"status","to":"dispatch:ctx_done","handled":false,"subject":"r"}]}'
+lh >/dev/null
+python3 - "$tmp/state/lead-health.json" <<'EOF'
+import json, sys, time
+p = sys.argv[1]; s = json.load(open(p)); s["seen"]["msg_b1"] = time.time() - 25 * 3600; json.dump(s, open(p, "w"))
+EOF
+mv "$FAKE/inbox-lap.json" "$FAKE/inbox-lap.off"; lh >/dev/null; mv "$FAKE/inbox-lap.off" "$FAKE/inbox-lap.json"
+out="$(lh)"; ! grep -q 'UNSENT .*msg_b1' <<<"$out" \
+  && ok "an unreadable inbox doesn't restart its mail's age" || bad "lead-health forgot remote mail age" "$out"
+fj inbox-lap '{"ok":true,"result":[]}'
+# A paired machine that doesn't answer is one OFFLINE note, not STALLED leads or new alerts.
+fj worker-show-ctx_remote '{"ok":true,"result":{"server":{"name":"lap"},"observation":{"status":"identity_changed"}}}'
+lh --watch >/dev/null; lh --ack
+off='{"ok":false,"error":{"code":"remote_runtime_unavailable","message":"Could not connect to the remote Orca runtime: the host did not answer"}}'
+fj worker-show-ctx_remote "$off"
+out="$(lh)"; rc=$?
+{ [ $rc = 0 ] && grep -q 'OFFLINE  lap: .*remote-broken \[ctx_remote\]' <<<"$out" && ! grep -q STALLED <<<"$out"; } \
+  && ok "an offline machine is one OFFLINE note, exit 0" || bad "lead-health offline note" "rc=$rc $out"
+[ -z "$(lh --watch)" ] && ok "watch: no alert when only reachability changed" || bad "lead-health offline alerted"
+lh --ack
+fj worker-show-ctx_remote '{"ok":true,"result":{"server":{"name":"lap"},"observation":{"status":"identity_changed"}}}'
+[ -z "$(lh --watch)" ] && ok "watch: a problem alerted before the machine slept isn't re-alerted on wake" || bad "lead-health re-alerted after wake"
+lh --ack
+fj worker-show-ctx_remote '{"ok":true,"result":{"server":{"name":"lap"},"observation":{"status":"live"}}}'
+# A task Orca still lists as open whose worker finished is shown as done, not checked.
+fj worker-show-ctx_remote '{"ok":true,"result":{"server":{"name":"lap"},"worker":{"state":"succeeded"},"observation":{"status":"exited"}}}'
+out="$(lh)"; rc=$?
+{ [ $rc = 0 ] && grep -q 'done .*remote-broken.*worker finished' <<<"$out"; } \
+  && ok "an open task whose worker finished is done, not STALLED" || bad "lead-health finished worker" "rc=$rc $out"
+fj worker-show-ctx_remote '{"ok":true,"result":{"server":{"name":"lap"},"observation":{"status":"live"}}}'
 fj inbox '{"ok":true,"result":[]}'
 
 echo "lead-continue"
@@ -268,6 +360,49 @@ lc ctx_ffffffffffff --spec hi --dry-run 2>"$tmp/err"; rc=$?
 { [ $rc = 1 ] && grep -q "can't show dispatch" "$tmp/err"; } && ok "fails clearly for an unknown dispatch" || bad "lead-continue unknown" "rc=$rc"
 lc ctx_done --dry-run 2>/dev/null; [ $? = 2 ] && ok "needs a spec" || bad "lead-continue without spec"
 out="$(lc ctx_local --spec hi --dry-run)"; grep -q -- ' --keep-open ' <<<"$out" && ok "starts follow-ups with --keep-open" || bad "lead-continue keep-open" "$out"
+[ -f "$FAKE/worker-list.json" ] && cp "$FAKE/worker-list.json" "$tmp/worker-list.lc.bak"
+fj worker-list '{"ok":true,"result":{"workers":[{"dispatchId":"ctx_busybusybusy","terminal":"term_abc","outcome":"in_progress"}]}}'
+fj worker-show-ctx_done '{"ok":true,"result":{"server":{"name":"lap"},"worker":{"agentTerminalHandle":"term_abc","worktreeId":"r1::/Users/user/docs"}}}'
+out="$(lc ctx_done --spec hi --dry-run 2>&1)"; rc=$?
+{ [ $rc = 1 ] && grep -q 'open dispatch, ctx_busybusybusy' <<<"$out" && tail -1 <<<"$out" | grep -q 'NOT SENT'; } \
+  && ok "refuses a chat that still has an open dispatch, NOT SENT last" || bad "lead-continue open dispatch" "rc=$rc $out"
+fj worker-list '{"ok":true,"result":{"workers":[]}}'
+lcr() { CHIEFOFSTAFF_STATE_DIR="$tmp/state" LEAD_CONTINUE_WAIT=0 LEAD_CONTINUE_TRIES=3 lc "$@"; }
+fj worker-start '{"ok":true,"result":{"dispatchId":"ctx_111111111111"}}'
+fj worker-show-ctx_111111111111 '{"ok":true,"result":{"state":"failed","stage":"agent_readiness","attention":["failure"],"lastError":"Terminal term_abc already has an active dispatch"}}'
+out="$(lcr ctx_done --spec hi 2>&1)"; rc=$?
+{ [ $rc = 1 ] && grep -q 'already has an active dispatch' <<<"$out" && tail -1 <<<"$out" | grep -q 'NOT SENT'; } \
+  && ok "fails loudly when Orca fails the new dispatch after accepting it" || bad "lead-continue failed dispatch" "rc=$rc $out"
+fj worker-show-ctx_111111111111 '{"ok":true,"result":{"state":"ready","stage":"input_accepted"}}'
+out="$(lcr ctx_done --spec hi 2>&1)"; rc=$?
+{ [ $rc = 0 ] && tail -1 <<<"$out" | grep -q 'STARTED ctx_111111111111'; } \
+  && ok "says STARTED last once Orca shows the work was taken" || bad "lead-continue started" "rc=$rc $out"
+fj worker-show-ctx_111111111111 '{"ok":true,"result":{"state":"ready","stage":"dispatching"}}'
+out="$(lcr ctx_done --spec hi 2>&1)"; rc=$?
+{ [ $rc = 3 ] && tail -2 <<<"$out" | grep -q 'NOT CONFIRMED'; } \
+  && ok "says NOT CONFIRMED when Orca never shows the work taken" || bad "lead-continue unconfirmed" "rc=$rc $out"
+rm -f "$FAKE/worker-start.json" "$FAKE/worker-show-ctx_111111111111.json" "$FAKE/worker-list.json"
+[ -f "$tmp/worker-list.lc.bak" ] && cp "$tmp/worker-list.lc.bak" "$FAKE/worker-list.json"
+
+echo "lead-move"
+lm() { CHIEFOFSTAFF_LEDGER="$tmp/ledger4.md" ORCA="$tmp/fake-orca" bin/lead-move "$@"; }
+fj worker-show-ctx_done '{"ok":true,"result":{"dispatch":{"taskId":"t9"},"worker":{"agentTerminalHandle":"term_abc","worktreeId":"r1::/Users/user/old clone/webapp"}}}'
+cp "$FAKE/task-list.json" "$tmp/task-list.bak"
+fj task-list '{"ok":true,"result":{"tasks":[{"id":"t9","status":"completed","title":"# Lead: webapp — the app, phase 2"}]}}'
+out="$(lm ctx_done --repo id:r9 --spec 'carry on' --on lap --dry-run)"
+{ grep -q -- 'worker-start' <<<"$out" && grep -q -- '--worktree new-top-level' <<<"$out" && grep -q -- '--repo id:r9' <<<"$out" \
+  && grep -q -- '--keep-open' <<<"$out" && grep -q -- '--run run_dddddddddddd' <<<"$out" && grep -q -- '--on lap' <<<"$out" \
+  && grep -q -- '--name webapp-the-app-phase-2 ' <<<"$out" && grep -q -- '--model opus ' <<<"$out" && grep -q 'worker-read --dispatch ctx_done' <<<"$out" \
+  && grep -q '/Users/user/old clone/webapp' <<<"$out" && grep -q 'carry on' <<<"$out"; } \
+  && ok "lead-move --dry-run prints a kept-open worker-start in a new workspace, spec names the old dispatch" || bad "lead-move dry run" "$out"
+cp "$tmp/task-list.bak" "$FAKE/task-list.json"
+out="$(lm ctx_done --repo id:r9 --spec hi --model sonnet --dry-run)"; grep -q -- '--model sonnet ' <<<"$out" \
+  && ok "lead-move takes --model" || bad "lead-move model" "$out"
+lm ctx_done --spec hi --dry-run 2>/dev/null; [ $? = 2 ] && ok "lead-move needs --repo" || bad "lead-move without repo"
+lm ctx_done --repo id:r9 --dry-run 2>/dev/null; [ $? = 2 ] && ok "lead-move needs a spec" || bad "lead-move without spec"
+out="$(lm ctx_ffffffffffff --repo id:r9 --spec hi --dry-run)"; { grep -q -- '--name lead ' <<<"$out" && ! grep -q 'Its workspace was' <<<"$out"; } \
+  && ok "lead-move copes with an old dispatch Orca can't show" || bad "lead-move unknown old" "$out"
+rm -f "$FAKE/worker-show-ctx_done.json"
 
 echo "keep-open"
 fj worker-list '{"ok":false,"result":{"workers":[
@@ -340,6 +475,16 @@ out="$(ow)"
 { grep -q 'notes app/docs; idle 20 d; 1 chat (1 done); chiefofstaff lead ctx_new (active, kept open)$' <<<"$out" \
   && ! grep -q 'ctx_old\|ctx_closed' <<<"$out"; } \
   && ok "shows the newest lead per chat, drops kept-open records whose terminal is gone" || bad "open-work leads" "$out"
+cp "$FAKE/ps-$other_env.json" "$tmp/ps-other.bak"
+python3 - "$FAKE/ps-$other_env.json" "$now_ms" <<'PY'
+import json, sys
+ws = [{"worktreeId": f"r9::/Users/user/w{i}", "repo": "big", "displayName": f"w{i}", "lastActivityAt": int(sys.argv[2]),
+       "agents": [{"state": "done", "displayName": "x" * 200}]} for i in range(1500)]
+open(sys.argv[1], "w").write(json.dumps({"ok": True, "result": {"worktrees": ws}}))
+PY
+out="$(ow 2>&1)"; grep -q 'big/w1499' <<<"$out" && ! grep -q 'Argument list too long' <<<"$out" \
+  && ok "lists a machine whose worktree listing is over 128 KB" || bad "open-work large listing" "$(tail -3 <<<"$out")"
+cp "$tmp/ps-other.bak" "$FAKE/ps-$other_env.json"
 rm -f "$FAKE/ps-$other_env.json"
 out="$(ow)"; grep -q "can't list workspaces" <<<"$out" && grep -q 'api/a' <<<"$out" \
   && ok "says when a machine can't be listed, still lists the other" || bad "open-work unreachable" "$out"
@@ -355,6 +500,20 @@ PATH="$tmp/bin-gh:$PATH" ORCA="$tmp/fake-orca" bin/ensure-project zz-proj --path
 { [ $rc = 1 ] && grep -q 'Orca refused to add' "$tmp/err" && grep -q 'not_found' "$tmp/err"; } \
   && ok "reports Orca's refusal instead of exiting silently" || bad "ensure-project silent failure" "rc=$rc $(cat "$tmp/err")"
 rm "$FAKE/setups.json"
+# A fork: Orca has the folder under its upstream's project id. A stale setup is reported.
+mkdir -p "$tmp/fork"
+git -C "$tmp/fork" init -q -b main && git -C "$tmp/fork" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+  && git -C "$tmp/fork" remote add origin git@github.com:example-owner/zz-fork.git
+fj setups "{\"ok\":true,\"result\":{\"setups\":[
+ {\"id\":\"s1\",\"projectId\":\"github:upstream/zz-fork\",\"hostId\":\"local\",\"repoId\":\"repo-fork-1\",\"path\":\"$tmp/fork\",\"setupMethod\":\"legacy-repo\"},
+ {\"id\":\"s2\",\"projectId\":\"github:example-owner/gone\",\"hostId\":\"local\",\"path\":\"$tmp/does-not-exist\",\"setupMethod\":\"imported-existing-folder\"}]}}"
+out="$(PATH="$tmp/bin-gh:$PATH" ORCA="$tmp/fake-orca" bin/ensure-project zz-fork --path "$tmp/fork" --dry-run 2>&1)"; rc=$?
+{ [ $rc = 0 ] && grep -q 'already set up' <<<"$out" && grep -q 'github:upstream/zz-fork' <<<"$out" && grep -q 'repo-fork-1' <<<"$out" \
+  && ! grep -q 'would: .*setup-existing-folder' <<<"$out"; } \
+  && ok "ensure-project: a folder Orca has under an upstream project counts as set up" || bad "ensure-project fork" "rc=$rc $out"
+{ grep -q "$tmp/does-not-exist" <<<"$out" && grep -q 'orca project setup-delete --setup s2' <<<"$out"; } \
+  && ok "ensure-project: reports a setup whose folder is missing, with the removal command" || bad "ensure-project stale setup" "$out"
+rm -f "$FAKE/setups.json"
 
 echo "usage"
 # Snapshots as bin/_usage.js dump writes them; NOW is fixed. H = 1 hour in ms.
@@ -564,6 +723,26 @@ PY
 out="$(us --watch)"; ! grep -q "^Resume" <<<"$out" && ok "pause: no reading for the account in use doesn't resume" || bad "pause resumed without a reading" "$out"
 mkusage "$U" 20 80 20 80
 
+echo "follow-up"
+fu() { CHIEFOFSTAFF_STATE_DIR="$tmp/fu" CHIEFOFSTAFF_NOW="${FU_NOW:-1800000000}" bin/follow-up "$@"; }
+out="$(fu +2h 'check  the webapp lead')"; grep -q '^follow-up f1: due .*: check the webapp lead$' <<<"$out" \
+  && ok "adds a follow-up and prints its id" || bad "follow-up add" "$out"
+fu 2030-01-01 'new year' >/dev/null; fu '+1d' 'tomorrow' >/dev/null
+out="$(fu --list)"; { [ "$(wc -l <<<"$out")" = 3 ] && head -1 <<<"$out" | grep -q '^f1 ' && tail -1 <<<"$out" | grep -q 'new year'; } \
+  && ok "--list shows pending follow-ups, soonest first" || bad "follow-up --list" "$out"
+[ -z "$(fu --due)" ] && ok "--due is silent before anything is due" || bad "follow-up --due early" "$(fu --due)"
+out="$(FU_NOW=$((1800000000 + 3*3600)) fu --due)"; { grep -q '^Follow-up due: check the webapp lead (f1, set ' <<<"$out" && [ "$(wc -l <<<"$out")" = 1 ]; } \
+  && ok "--due names each due follow-up once it has passed" || bad "follow-up --due" "$out"
+fu --ack f1 && [ -z "$(FU_NOW=$((1800000000 + 3*3600)) fu --due)" ] && fu --list | grep -q tomorrow \
+  && ok "--ack drops only the acked follow-ups" || bad "follow-up --ack"
+fu --cancel f3 >/dev/null && ! fu --list | grep -q tomorrow && ok "--cancel drops one" || bad "follow-up --cancel"
+fu --cancel f9 2>/dev/null; [ $? = 1 ] && ok "--cancel fails for an unknown id" || bad "follow-up --cancel unknown"
+fu 'next tuesday' x 2>/dev/null; [ $? = 2 ] && ok "refuses a time it can't read" || bad "follow-up bad time"
+fu 2020-01-01 x 2>/dev/null; [ $? = 2 ] && ok "refuses a time already past" || bad "follow-up past time"
+out="$(fu +1h 'after removals')"; grep -q '^follow-up f4:' <<<"$out" && ok "never reuses an id" || bad "follow-up id reuse" "$out"
+out="$(FU_NOW=$(python3 -c 'import datetime as d; print(int(d.datetime(2027,3,1,15,0).timestamp()))') fu 14:00 clock)"
+grep -q 'due Tue 02 Mar 14:00' <<<"$out" && ok "HH:MM means the next time that clock time comes round" || bad "follow-up HH:MM" "$out"
+
 echo "sitrep-ping"
 printf '## Chiefofstaff run\n\n- Host: laptop\n- Run: `run_dddddddddddd`\n\n## Machines\n' > "$tmp/ledger3.md"
 for job in sitrep watch retro; do
@@ -598,6 +777,43 @@ fj task-list '{"ok":true,"result":{"tasks":"not a list"}}'
 sp watch 2>/dev/null; grep -q 'lead-health itself failed.*crashed' "$FAKE/sent" 2>/dev/null && ok "watch: alerts when the check crashes" || bad "watch hid a crash" "$(cat "$FAKE/sent" 2>/dev/null)"
 cp "$tmp/task-list.json" "$FAKE/task-list.json"
 sp bogus 2>/dev/null; [ $? = 2 ] && ok "rejects an unknown job" || bad "sitrep-ping accepted an unknown job"
+printf '\n## Open cards\n\n- webapp: which login flow to keep (asked 2026-11-18)\n' >> "$tmp/ledger4.md"
+sp; grep -q 'Open cards (ledger' "$FAKE/sent" 2>/dev/null && grep -q 'webapp: which login flow to keep (asked 2026-11-18)' "$FAKE/sent" \
+  && ok "sitrep: carries the ledger's open cards" || bad "sitrep-ping open cards" "$(cat "$FAKE/sent" 2>/dev/null)"
+printf '{"next": 3, "items": [{"id": "f1", "due": 1000, "set": 900, "note": "check the docs lead took its default"},
+ {"id": "f2", "due": 99999999999, "set": 900, "note": "not yet"}]}' > "$tmp/state2/follow-ups.json"
+touch "$FAKE/fail-send"; sp watch 2>/dev/null; rm -f "$FAKE/fail-send"
+sp watch; { grep -q 'Follow-up due: check the docs lead took its default (f1' "$FAKE/sent" 2>/dev/null && ! grep -q 'not yet' "$FAKE/sent"; } \
+  && ok "watch: mails a due follow-up, retrying after a failed send" || bad "watch follow-up" "$(cat "$FAKE/sent" 2>/dev/null)"
+sp watch; [ ! -e "$FAKE/sent" ] && grep -q '"f2"' "$tmp/state2/follow-ups.json" && ! grep -q '"f1"' "$tmp/state2/follow-ups.json" \
+  && ok "watch: a follow-up fires once; later ones stay pending" || bad "watch repeated a follow-up" "$(cat "$FAKE/sent" 2>/dev/null)"
+
+echo "relay-message"
+rm_() { rm -f "$FAKE/sent"; CHIEFOFSTAFF_NO_PULL=1 CHIEFOFSTAFF_LEDGER="${RM_LEDGER:-$tmp/ledger4.md}" ORCA="$tmp/fake-orca" bin/relay-message "$@"; }
+printf 'book the meeting room\n' | RELAY_RECORDED_AT=2030-01-01T10:00:00Z TZ=UTC rm_ --via 'voice capture' \
+  && python3 - "$FAKE/sent" <<'PY' && ok "mails the run with the operator's words, source and time" || bad "relay-message (local)" "$(cat "$FAKE/sent" 2>/dev/null)"
+import json, sys
+a = json.loads(open(sys.argv[1]).read().splitlines()[0])
+v = lambda k: a[a.index(k) + 1]
+assert v("--to") == "run:run_dddddddddddd" and v("--from") == "operator-relay", a
+assert v("--subject") == "Relayed from Sam via voice capture (Tue 1 Jan, 10:00 UTC)", v("--subject")
+assert "book the meeting room" in v("--body") and "Relayed messages" in v("--body"), v("--body")
+assert "--environment" not in a, a
+PY
+rm_ --at 2030-01-01T10:00:00Z hello there && grep -q 'hello there' "$FAKE/sent" \
+  && ok "takes the message from its arguments" || bad "relay-message args" "$(cat "$FAKE/sent" 2>/dev/null)"
+printf '  \n' | rm_ 2>/dev/null; rc=$?
+{ [ $rc = 2 ] && [ ! -e "$FAKE/sent" ]; } && ok "refuses an empty message, sends nothing" || bad "relay-message empty" "rc=$rc"
+touch "$FAKE/fail-send"; printf 'x\n' | rm_ 2>/dev/null; rc=$?; rm -f "$FAKE/fail-send"
+[ $rc != 0 ] && ok "exits non-zero when the send fails, so the caller can retry" || bad "relay-message hid a failed send"
+printf '## Chiefofstaff run\n\n- Host: desktop\n\n## Machines\n' > "$tmp/ledger-norun.md"
+printf 'x\n' | RM_LEDGER="$tmp/ledger-norun.md" rm_ 2>/dev/null; rc=$?
+{ [ $rc = 1 ] && [ ! -e "$FAKE/sent" ]; } && ok "exits 1 with no run in the ledger" || bad "relay-message no run" "rc=$rc"
+printf 'x\n' | RM_LEDGER="$tmp/ledger3.md" rm_ && python3 - "$FAKE/sent" <<'PY' && ok "reaches a run on another machine through its paired Orca" || bad "relay-message (other machine)" "$(cat "$FAKE/sent" 2>/dev/null)"
+import json, sys
+a = json.loads(open(sys.argv[1]).read().splitlines()[0])
+assert a[a.index("--environment") + 1] == "lap" and a[a.index("--to") + 1] == "run:run_dddddddddddd", a
+PY
 
 # Threshold notices through sitrep-ping watch
 cat > "$tmp/fake-notify" <<'NOTIFY'

@@ -16,20 +16,26 @@ set -euo pipefail
 [ $# -eq 0 ] || { sed -n '2,13p' "$0"; exit 2; }
 run="$(ledger_field Run)"
 
+# Orca's listings go through files, not arguments: one argument over 128 KB fails with
+# "Argument list too long", and a busy machine's worktree list is bigger than that.
+data="$(mktemp -d)"; trap 'rm -rf "$data"' EXIT
 ps_json() { orca_anon worktree ps --json --limit 500 "$@" 2>&1 || true; }
-boxes=("$CHIEFOFSTAFF_HOST" "$(ps_json)")
-terms="$(orca_anon terminal list --json 2>/dev/null || true)"
+boxes=("$CHIEFOFSTAFF_HOST")
+ps_json > "$data/ps0"
+orca_anon terminal list --json > "$data/terms" 2>/dev/null || true
 for i in "${!OTHER_HOSTS[@]}"; do
-  boxes+=("${OTHER_HOSTS[$i]}" "$(ps_json --environment "${OTHER_ENVS[$i]}")")
-  terms+="
-$(orca_anon terminal list --json --environment "${OTHER_ENVS[$i]}" 2>/dev/null || true)"
+  boxes+=("${OTHER_HOSTS[$i]}")
+  ps_json --environment "${OTHER_ENVS[$i]}" > "$data/ps$((i + 1))"
+  { echo; orca_anon terminal list --json --environment "${OTHER_ENVS[$i]}" 2>/dev/null || true; } >> "$data/terms"
 done
-leads="$( [ -z "$run" ] || run_workers "$run" 2>/dev/null || true)"
+{ [ -z "$run" ] || run_workers "$run" 2>/dev/null || true; } > "$data/leads"
 
-python3 - "${CHIEFOFSTAFF_NOW_MS:-}" "$leads" "$terms" "$OPERATOR_NAME" "${boxes[@]}" <<'PY'
+python3 - "${CHIEFOFSTAFF_NOW_MS:-}" "$data" "$OPERATOR_NAME" "${boxes[@]}" <<'PY'
 import json, sys, time
-now_ms, leads_txt, terms_txt, operator = sys.argv[1:5]
-machines = list(zip(sys.argv[5::2], sys.argv[6::2]))  # (name, worktree ps output), this machine first
+now_ms, data, operator = sys.argv[1:4]
+leads_txt, terms_txt = (open(f"{data}/{n}").read() for n in ("leads", "terms"))
+# (name, worktree ps output), this machine first
+machines = [(name, open(f"{data}/ps{i}").read()) for i, name in enumerate(sys.argv[4:])]
 now = int(now_ms) / 1000 if now_ms else time.time()
 IDLE_DAYS = 7
 

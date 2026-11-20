@@ -107,6 +107,12 @@ for w in ws:
 print(n)' "$CHIEFOFSTAFF_REL"
 }
 
+# Ledger → "## Open cards": one "- <project>: <question in a few words> (asked YYYY-MM-DD)"
+# line per card put to the operator and not yet answered. Prints those lines; nothing if none.
+ledger_open_cards() {
+  sed -n '/^## Open cards/,/^## /p' "$LEDGER" | grep '^- ' || true
+}
+
 # Project entries under "## Projects" longer than LEDGER_ENTRY_WORDS words (default 120),
 # one "<project>: <n> words" line each. Entries hold current state only; history is git's.
 ledger_long_entries() {

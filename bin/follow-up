@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Follow-ups: times chiefofstaff sets itself to come back to something ("check on it in an
+# hour", a lead's stated default). Kept in a file on this machine, not in the chat, so they
+# survive a restart, a compaction or the machine being off. The 15-minute watch
+# (bin/sitrep-ping watch) mails the run "Follow-up due: <note>" once each is due, once.
+#
+#   follow-up '<when>' '<note>'   add one; <when> is +30m, +2h, +1d, HH:MM (next time that
+#                                 clock time comes round), YYYY-MM-DD or 'YYYY-MM-DD HH:MM'
+#                                 (local time)
+#   follow-up --list              pending follow-ups, soonest first, with their ids
+#   follow-up --cancel <id>       drop one
+#   follow-up --due               (the watch) one "Follow-up due: <note> (<id>, set <time>)"
+#                                 line per due follow-up; prints nothing when none is due
+#   follow-up --ack <id>...       (the watch, after its mail went out) drop those, so each
+#                                 fires once; one not acked fires again on the next watch
+#
+# State: ${CHIEFOFSTAFF_STATE_DIR:-~/.local/state/chiefofstaff}/follow-ups.json, on this
+# machine only.
+set -euo pipefail
+[ $# -ge 1 ] || { sed -n '2,18p' "$0"; exit 2; }
+state="${CHIEFOFSTAFF_STATE_DIR:-$HOME/.local/state/chiefofstaff}"; mkdir -p "$state"
+python3 - "$state/follow-ups.json" "${CHIEFOFSTAFF_NOW:-}" "$@" <<'PY'
+import datetime as dt, fcntl, json, os, re, sys
+path, now_arg, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+now = dt.datetime.fromtimestamp(int(now_arg)) if now_arg else dt.datetime.now()
+def die(msg, code=1):
+    print(f"follow-up: {msg}", file=sys.stderr); sys.exit(code)
+def show(t):
+    return dt.datetime.fromtimestamp(t).strftime("%a %d %b %H:%M")
+
+def parse_when(w):
+    w = w.strip()
+    m = re.fullmatch(r"\+(\d+)([mhd])", w)
+    if m:
+        n, u = int(m.group(1)), m.group(2)
+        return now + dt.timedelta(minutes=n * {"m": 1, "h": 60, "d": 1440}[u])
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", w)
+    if m:
+        t = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        return t if t > now else t + dt.timedelta(days=1)
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(w, fmt)
+        except ValueError:
+            pass
+    die(f"can't read '{w}': use +30m, +2h, +1d, HH:MM, YYYY-MM-DD or 'YYYY-MM-DD HH:MM'", 2)
+
+with open(path, "a+") as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    f.seek(0)
+    text = f.read()
+    try:
+        d = json.loads(text) if text.strip() else {}
+    except ValueError:
+        die(f"{path} isn't valid JSON; fix or remove it")
+    items, nxt = d.get("items", []), d.get("next", 1)
+    changed = False
+    cmd = args[0]
+    if cmd == "--list":
+        if len(args) != 1: die("--list takes nothing", 2)
+        if not items:
+            print("no follow-ups pending")
+        for i in sorted(items, key=lambda i: i["due"]):
+            late = " (due now)" if i["due"] <= now.timestamp() else ""
+            print(f"{i['id']}  {show(i['due'])}{late}  {i['note']}")
+    elif cmd == "--cancel":
+        if len(args) != 2: die("--cancel takes one id", 2)
+        keep = [i for i in items if i["id"] != args[1]]
+        if len(keep) == len(items): die(f"no pending follow-up {args[1]} (see --list)")
+        items, changed = keep, True
+        print(f"follow-up: cancelled {args[1]}")
+    elif cmd == "--due":
+        if len(args) != 1: die("--due takes nothing", 2)
+        for i in sorted(items, key=lambda i: i["due"]):
+            if i["due"] <= now.timestamp():
+                print(f"Follow-up due: {i['note']} ({i['id']}, set {show(i['set'])} for {show(i['due'])})")
+    elif cmd == "--ack":
+        ids = set(args[1:])
+        keep = [i for i in items if i["id"] not in ids]
+        items, changed = keep, len(keep) != len(items)
+    elif cmd.startswith("--"):
+        die(f"unknown option {cmd}", 2)
+    else:
+        if len(args) != 2: die("give '<when>' '<note>'", 2)
+        note = " ".join(args[1].split())
+        if not note: die("the note is empty", 2)
+        due = parse_when(args[0])
+        if due <= now: die(f"{due:%Y-%m-%d %H:%M} has already passed", 2)
+        fid = f"f{nxt}"
+        items.append({"id": fid, "due": int(due.timestamp()), "set": int(now.timestamp()), "note": note})
+        nxt += 1; changed = True
+        print(f"follow-up {fid}: due {show(due.timestamp())}: {note}")
+    if changed:
+        f.seek(0); f.truncate()
+        json.dump({"next": nxt, "items": items}, f, indent=1)
+        f.flush(); os.fsync(f.fileno())
+PY

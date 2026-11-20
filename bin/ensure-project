@@ -122,30 +122,65 @@ else
   note "created GitHub repo $slug (${visibility#--}) and pushed"
 fi
 
-# 4. Orca project on this machine.
-setup="$("$ORCA" project setups --json 2>/dev/null | python3 -c '
+# 4. Orca project on this machine. Orca may know the folder under another project id (a fork
+# is recorded under its upstream); that still gives leads a usable repo id, so it counts.
+# Local setups whose folder is gone are listed too (this slug's or any other).
+setups_info="$("$ORCA" project setups --json 2>/dev/null | python3 -c '
 import json, sys, os
 p = os.path.realpath(sys.argv[1])
-d = json.load(sys.stdin); r = d.get("result", d)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+r = d.get("result", d)
 xs = r.get("setups", r.get("projectHostSetups", r)) if isinstance(r, dict) else r
-for x in xs:
-    if x.get("hostId") == "local" and os.path.realpath(x.get("path") or "") == p:
-        print(x.get("setupMethod") or "?"); break' "$path")"
-if [ "$setup" != imported-existing-folder ] && [ "$setup" != cloned ]; then
+f = lambda v: str(v) if v else "-"
+found = False
+for x in xs if isinstance(xs, list) else []:
+    if x.get("hostId") != "local": continue
+    xp = x.get("path") or ""
+    if xp and os.path.realpath(xp) == p and not found:
+        found = True
+        print("\t".join(["match", f(x.get("setupMethod")), f(x.get("projectId")), f(x.get("repoId"))]))
+    if xp and not os.path.exists(xp):
+        print("\t".join(["stale", f(x.get("id") or x.get("setupId")), f(x.get("projectId")), xp]))' "$path")"
+setup=""; setup_proj=""; setup_repo=""; stale=()
+while IFS=$'\t' read -r kind a1 a2 a3; do
+  case "$kind" in
+    match) setup="${a1#-}"; setup_proj="${a2#-}"; setup_repo="${a3#-}"; [ -n "$setup" ] || setup="?" ;;
+    stale) stale+=("$a3 (project ${a2#-}, setup ${a1#-}): orca project setup-delete --setup ${a1#-}") ;;
+  esac
+done <<<"$setups_info"
+other_proj=""
+if [ -n "$setup" ] && [ "$(tr 'A-Z' 'a-z' <<<"$setup_proj")" != "$(tr 'A-Z' 'a-z' <<<"github:$slug")" ]; then
+  other_proj=1
+  notes_extra="Orca has it as project ${setup_proj:-<none>} (a fork's upstream); fine for leads"
+elif [ "$setup" != imported-existing-folder ] && [ "$setup" != cloned ]; then
   if [ -n "$dry" ]; then
     echo "would: $ORCA project setup-existing-folder --project github:$slug --host local --path $path --kind git"
   elif ! out="$("$ORCA" project setup-existing-folder --project "github:$slug" --host local --path "$path" --kind git --json 2>&1)" \
        || grep -q '"ok": *false' <<<"$out"; then
-    # Orca can know this folder under another project (a fork's upstream, say).
-    echo "ensure-project: Orca refused to add $path as project github:$slug${setup:+ (it has it as a $setup setup)}:" >&2
-    echo "  $(head -c 400 <<<"$out")" >&2
-    [ ${#did[@]} -eq 0 ] || printf '  done before that: %s\n' "${did[@]}" >&2
-    exit 1
+    if [ -n "$setup_repo" ]; then
+      refused=1; did+=("warning: legacy upgrade refused; using the existing repo id")
+      echo "ensure-project: warning: Orca refused to upgrade $path (a $setup setup) to project github:$slug; the existing repo id still works:" >&2
+      echo "  $(head -c 400 <<<"$out")" >&2
+    else
+      echo "ensure-project: Orca refused to add $path as project github:$slug${setup:+ (it has it as a $setup setup)}:" >&2
+      echo "  $(head -c 400 <<<"$out")" >&2
+      [ ${#did[@]} -eq 0 ] || printf '  done before that: %s\n' "${did[@]}" >&2
+      exit 1
+    fi
   fi
-  note "${setup:+upgraded legacy link; }added to Orca as project github:$slug"
+  [ -n "${refused:-}" ] || note "${setup:+upgraded legacy link; }added to Orca as project github:$slug"
 fi
 
 repo_id="$("$ORCA" repo list 2>/dev/null | awk -v p="$path" '$3 == p {print $1}' | head -1)"
+[ -n "$repo_id" ] || repo_id="$setup_repo"
 echo "ensure-project: $slug on $CHIEFOFSTAFF_HOST at $path"
 if [ ${#did[@]} -eq 0 ]; then echo "  already set up; nothing to do"; else printf '  %s\n' "${did[@]}"; fi
 echo "  orca repo id: ${repo_id:-<unknown${dry:+ (dry run)}>}"
+if [ -n "$other_proj" ]; then echo "  already set up: $notes_extra"; fi
+if [ ${#stale[@]} -gt 0 ]; then
+  echo "  Orca setups whose folder is missing (remove with the command shown; I never run it):"
+  printf '    %s\n' "${stale[@]}"
+fi

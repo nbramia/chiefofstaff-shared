@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Restart a lead in a new workspace of a repo, for a lead whose chat can't continue: Orca
+# can't move a chat to another workspace (the repo was re-cloned elsewhere and the old chat
+# sits outside the new Orca project), and an account switch can leave a terminal with no
+# agent in it.
+#
+#   lead-move <old-dispatch> --repo <selector> (--spec-file <f> | --spec <text>) [--on <env>] [--name <n>] [--model <m>] [--dry-run]
+#       --repo   the repo in Orca on the machine that will do the work (id:<repoId>)
+#       --on     another machine's Orca environment, for a lead there
+#       --name   the new workspace's name (default: a slug of the old task's title, else "lead")
+#       --model  the lead's Claude model (default: opus)
+#
+# Starts a fresh kept-open dispatch (worker-start --worktree new-top-level) in chiefofstaff's
+# run (ledger). Its spec is a short preamble naming the old dispatch and how to read its
+# transcript (orca orchestration worker-read --dispatch <old>), then the given spec. Checks
+# with bin/keep-open and prints the new dispatch id: record it in the ledger. On another
+# machine, do the receipt check next (AGENTS.md → Leads). --dry-run prints the command and
+# the composed spec and runs nothing.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+
+old=""; repo=""; on=""; name=""; dry=""; specfile=""; spectext=""; model=opus
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) [ $# -ge 2 ] || { sed -n '2,18p' "$0"; exit 2; }; repo="$2"; shift 2 ;;
+    --on) [ $# -ge 2 ] || { sed -n '2,18p' "$0"; exit 2; }; on="$2"; shift 2 ;;
+    --name) [ $# -ge 2 ] || { sed -n '2,18p' "$0"; exit 2; }; name="$2"; shift 2 ;;
+    --model) [ $# -ge 2 ] || { sed -n '2,18p' "$0"; exit 2; }; model="$2"; shift 2 ;;
+    --spec-file) [ $# -ge 2 ] || { sed -n '2,18p' "$0"; exit 2; }; specfile="$2"; shift 2 ;;
+    --spec) [ $# -ge 2 ] || { sed -n '2,18p' "$0"; exit 2; }; spectext="$2"; shift 2 ;;
+    --dry-run) dry=1; shift ;;
+    ctx_*) old="$1"; shift ;;
+    *) sed -n '2,18p' "$0"; exit 2 ;;
+  esac
+done
+[ -n "$old" ] || { echo "lead-move: give the old lead's dispatch id (ctx_...)" >&2; exit 2; }
+[ -n "$repo" ] || { echo "lead-move: give --repo <selector>, e.g. id:<repoId>" >&2; exit 2; }
+if [ -n "$specfile" ]; then
+  [ -r "$specfile" ] || { echo "lead-move: can't read $specfile" >&2; exit 2; }
+  body="$(cat "$specfile")"
+elif [ -n "$spectext" ]; then body="$spectext"
+else echo "lead-move: give --spec-file or --spec" >&2; exit 2; fi
+
+run="$(ledger_field Run)"
+[ -n "$run" ] || { echo "lead-move: no chiefofstaff run in ledger.md" >&2; exit 2; }
+
+# What Orca knows about the old lead: its workspace path and task title (both optional).
+IFS=$'\t' read -r oldpath oldtitle < <("$ORCA" orchestration worker-show --dispatch "$old" --full --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin).get("result") or {}
+except Exception:
+    r = {}
+w = r.get("worker") or {}; t = r.get("terminal") or {}
+wt = w.get("worktreeId") or t.get("worktreeId") or ""
+path = wt.split("::", 1)[1] if "::" in wt else ""
+print((path or "-") + "\t" + ((r.get("dispatch") or {}).get("taskId") or "-"))') || true
+[ "${oldpath:--}" != - ] || oldpath=""
+[ "${oldtitle:--}" != - ] || oldtitle=""
+# worker-show names the task; its title comes from the run's task list.
+if [ -n "$oldtitle" ]; then
+  oldtitle="$("$ORCA" orchestration task-list --run "$run" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    ts = (json.load(sys.stdin).get("result") or {}).get("tasks") or []
+except Exception:
+    ts = []
+print(next((t.get("title") or "" for t in ts if t.get("id") == sys.argv[1]), ""))' "$oldtitle" || true)"
+fi
+# A workspace name: the title's first words as a slug, else "lead".
+[ -n "$name" ] || name="$(printf '%s' "$oldtitle" | sed -E 's/^# *//; s/^Lead: *//' | tr 'A-Z' 'a-z' \
+  | sed -E 's/[^a-z0-9]+/-/g; s/^-+//' | cut -c1-30 | sed -E 's/-+$//')"
+[ -n "$name" ] || name=lead
+
+spec="You continue the work of an earlier lead (dispatch $old) whose chat can't continue (its repo moved, or its terminal lost its agent). Read its transcript first: orca orchestration worker-read --dispatch $old (follow --cursor to the end)."
+[ -z "$oldpath" ] || spec+=" Its workspace was $oldpath; it may hold uncommitted or unpushed work worth checking."
+spec+=$'\n\n'"$body"
+
+tmpf="$(mktemp "${TMPDIR:-/tmp}/lead-move.XXXXXX")"; trap 'rm -f "$tmpf"' EXIT
+printf '%s\n' "$spec" > "$tmpf"
+cmd=("$ORCA" orchestration worker-start --run "$run" --worktree new-top-level --repo "$repo"
+     --name "$name" --agent claude --model "$model" --keep-open --spec-file "$tmpf")
+[ -z "$on" ] || cmd+=(--on "$on")
+if [ -n "$dry" ]; then
+  printf 'would run:'; printf ' %q' "${cmd[@]}"; echo
+  echo "spec:"; sed 's/^/  /' "$tmpf"
+  exit 0
+fi
+out="$("${cmd[@]}" 2>&1)" || { echo "lead-move: worker-start failed:" >&2; echo "$out" >&2; exit 1; }
+echo "$out"
+new="$(grep -oE 'ctx_[0-9a-f]{12}' <<<"$out" | head -1 || true)"
+echo "lead-move: ${new:-new dispatch} replaces $old${on:+ on $on}. Record it in the ledger."
+"$CHIEFOFSTAFF_DIR/bin/lead-health" --dismiss "$old" >/dev/null 2>&1 || true  # its unsent mail is moot now
+if [ -n "$new" ]; then
+  "$CHIEFOFSTAFF_DIR/bin/keep-open" "$new" \
+    || echo "  Orca hasn't confirmed it will stay open: run bin/keep-open $new again, and tell $OPERATOR_NAME under Broken if it still fails." >&2
+fi
+[ -z "$on" ] || echo "  It runs on $on: send the receipt check now (AGENTS.md → Leads)."
