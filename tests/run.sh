@@ -26,13 +26,15 @@ EOF
 real_conf="${CHIEFOFSTAFF_CONFIG:-$here/chiefofstaff.conf}"
 export CHIEFOFSTAFF_CONFIG="$tmp/test.conf" CHIEFOFSTAFF_MACHINE=desktop
 unset CHIEFOFSTAFF_NOTIFY
+# Never a real notices log.
+export CHIEFOFSTAFF_NOTICE_LOG="$tmp/no-notices.jsonl"
 
 echo "syntax"
-for f in bin/_common.sh bin/start-chiefofstaff bin/sitrep-ping bin/ensure-project bin/orca-account bin/lead-health bin/ledger-edit bin/usage bin/lead-continue bin/last-chat bin/keep-open bin/open-work bin/install-timers bin/lead-move bin/follow-up bin/relay-message tests/run.sh; do
+for f in bin/_common.sh bin/start-chiefofstaff bin/sitrep-ping bin/ensure-project bin/orca-account bin/lead-health bin/ledger-edit bin/usage bin/lead-continue bin/last-chat bin/keep-open bin/open-work bin/install-timers bin/lead-move bin/follow-up bin/relay-message bin/notices bin/vault-link bin/vault-link-server tests/run.sh; do
   bash -n "$f" 2>"$tmp/err" && ok "bash -n $f" || bad "bash -n $f" "$(cat "$tmp/err")"
 done
 if command -v shellcheck >/dev/null; then
-  shellcheck -S error bin/_common.sh bin/start-chiefofstaff bin/sitrep-ping bin/ensure-project bin/lead-health bin/ledger-edit bin/usage bin/lead-continue bin/last-chat bin/keep-open bin/open-work bin/install-timers bin/lead-move bin/follow-up bin/relay-message >"$tmp/sc" 2>&1 \
+  shellcheck -S error bin/_common.sh bin/start-chiefofstaff bin/sitrep-ping bin/ensure-project bin/lead-health bin/ledger-edit bin/usage bin/lead-continue bin/last-chat bin/keep-open bin/open-work bin/install-timers bin/lead-move bin/follow-up bin/relay-message bin/notices bin/vault-link bin/vault-link-server >"$tmp/sc" 2>&1 \
     && ok "shellcheck (errors)" || bad "shellcheck (errors)" "$(head -20 "$tmp/sc")"
 else skip "shellcheck not installed"; fi
 
@@ -743,6 +745,79 @@ out="$(fu +1h 'after removals')"; grep -q '^follow-up f4:' <<<"$out" && ok "neve
 out="$(FU_NOW=$(python3 -c 'import datetime as d; print(int(d.datetime(2027,3,1,15,0).timestamp()))') fu 14:00 clock)"
 grep -q 'due Tue 02 Mar 14:00' <<<"$out" && ok "HH:MM means the next time that clock time comes round" || bad "follow-up HH:MM" "$out"
 
+echo "notices"
+bn() { CHIEFOFSTAFF_STATE_DIR="$tmp/bn" CHIEFOFSTAFF_NOTICE_LOG="$tmp/notices.jsonl" bin/notices "$@"; }
+note() { python3 -c 'import json,sys; print(json.dumps({"ts":sys.argv[1],"bot":sys.argv[2],"source":sys.argv[3],"text":sys.argv[4]}))' "$@" >> "$tmp/notices.jsonl"; }
+note 2026-01-05T10:00:00Z alerts old/history 'an old notice'
+[ -z "$(bn --watch)" ] && ok "first use starts at the log's end, no replay" || bad "notices replayed history"
+note 2026-01-05T11:00:00Z alerts myapp/worker "Job failed: exit code 1"
+note 2026-01-05T11:01:00Z alerts notify 'chiefofstaff: usage: claude at 80%'
+note 2026-01-05T11:02:00Z ops-bot myapp/check 'check: 2 invariants failed'
+out="$(bn --watch)"
+{ grep -q 'alerts, from myapp/worker' <<<"$out" && grep -q 'Job failed' <<<"$out" \
+  && grep -q 'ops-bot, from myapp/check' <<<"$out" && ! grep -q 'chiefofstaff:\|old notice' <<<"$out"; } \
+  && ok "--watch prints new notices with bot and source, skipping chiefofstaff's own" || bad "notices watch" "$out"
+[ -n "$(bn --watch)" ] && ok "repeats until acknowledged (a failed send retries)" || bad "notices lost unacked notices"
+bn --ack; [ -z "$(bn --watch)" ] && ok "--ack marks them seen" || bad "notices --ack"
+printf '{"ts":"t","bot":"b","source":"s","text":"half' >> "$tmp/notices.jsonl"
+[ -z "$(bn --watch)" ] && ok "a line still being written waits" || bad "notices read a partial line"
+printf ' done"}\n' >> "$tmp/notices.jsonl"
+out="$(bn --watch)"; grep -q 'half done' <<<"$out" && ok "and is read once complete" || bad "notices partial line" "$out"
+bn --ack
+for i in 1 2 3 4; do note t b s "n$i"; done
+out="$(NOTICES_MAX=3 bn --watch)"; { grep -q n3 <<<"$out" && ! grep -q n4 <<<"$out" && grep -q '1 more waiting' <<<"$out"; } \
+  && ok "caps a batch and says how many wait" || bad "notices cap" "$out"
+bn --ack; out="$(bn --watch)"; { grep -q n4 <<<"$out" && ! grep -q n3 <<<"$out"; } && ok "the rest come next time" || bad "notices rest" "$out"
+bn --ack
+: > "$tmp/notices.jsonl"; note t b s 'after rotation'
+out="$(bn --watch)"; grep -q 'after rotation' <<<"$out" && ok "a replaced log is read from its start" || bad "notices rotation" "$out"
+bn --ack
+out="$(bn --tail 2)"; grep -q 'after rotation' <<<"$out" && ok "--tail shows recent notices, seen or not" || bad "notices tail" "$out"
+CHIEFOFSTAFF_STATE_DIR="$tmp/bn2" CHIEFOFSTAFF_NOTICE_LOG="$tmp/none.jsonl" bin/notices --watch >/dev/null && ok "a missing log is no error" || bad "notices missing log"
+# Expected notices: a daily job's notice that didn't come by its deadline, once a day.
+cp "$tmp/test.conf" "$tmp/exp.conf"; printf 'EXPECTED_NOTICES=("daily job|myapp/job|Job complete|01:00|07:00")\n' >> "$tmp/exp.conf"
+at() { python3 -c 'import sys,datetime as d; print(int(d.datetime.strptime(sys.argv[1],"%Y-%m-%d %H:%M").timestamp()))' "$1"; }
+sc() { CHIEFOFSTAFF_CONFIG="$tmp/exp.conf" CHIEFOFSTAFF_STATE_DIR="$tmp/sc" CHIEFOFSTAFF_NOTICE_LOG="$tmp/job.jsonl" CHIEFOFSTAFF_NOW="$(at "$1")" bin/notices --watch; }
+sca() { CHIEFOFSTAFF_CONFIG="$tmp/exp.conf" CHIEFOFSTAFF_STATE_DIR="$tmp/sc" CHIEFOFSTAFF_NOTICE_LOG="$tmp/job.jsonl" bin/notices --ack; }
+utc() { python3 -c 'import sys,datetime as d; print(d.datetime.strptime(sys.argv[1],"%Y-%m-%d %H:%M").astimezone(d.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
+: > "$tmp/job.jsonl"; sc '2026-01-05 00:30' >/dev/null
+python3 -c 'import json,sys; print(json.dumps({"ts":sys.argv[1],"bot":"b","source":"myapp/job","text":"Job complete: example"}))' "$(utc '2026-01-05 02:10')" >> "$tmp/job.jsonl"
+sc '2026-01-05 00:30' >/dev/null; sca
+[ -z "$(sc '2026-01-05 06:30')" ] && ok "expected: quiet before its deadline" || bad "expected before deadline" "$(sc '2026-01-05 06:30')"
+[ -z "$(sc '2026-01-05 08:00')" ] && ok "expected: quiet when the notice came" || bad "expected with notice" "$(sc '2026-01-05 08:00')"
+out="$(sc '2026-01-06 07:15')"; grep -q "2026-01-06 chiefofstaff check: no 'daily job' notice" <<<"$out" \
+  && ok "expected: flags a day without it" || bad "expected missing" "$out"
+[ -n "$(sc '2026-01-06 07:30')" ] && ok "expected: repeats until acknowledged" || bad "expected lost unacked"
+sca; [ -z "$(sc '2026-01-06 10:00')" ] && ok "expected: once a day" || bad "expected repeated"
+python3 -c 'import json; print(json.dumps({"ts":"2026-01-10T15:00:00Z","bot":"b","source":"x","text":"new log"}))' > "$tmp/newlog.jsonl"
+out="$(CHIEFOFSTAFF_CONFIG="$tmp/exp.conf" CHIEFOFSTAFF_STATE_DIR="$tmp/sc4" CHIEFOFSTAFF_NOTICE_LOG="$tmp/newlog.jsonl" CHIEFOFSTAFF_NOW="$(at '2026-01-10 11:00')" bin/notices --watch)"
+! grep -q 'chiefofstaff check' <<<"$out" && ok "expected: quiet when the log is too new to judge" || bad "expected new log" "$out"
+
+echo "vault links"
+cp "$tmp/test.conf" "$tmp/vault.conf"; printf 'VAULT_NAME="My Notes"\nVAULT_LINK_HOST="notes-host"\nVAULT_LINK_PORT="4790"\nVAULT_LINK_ADDRS="127.0.0.1"\n' >> "$tmp/vault.conf"
+vl() { CHIEFOFSTAFF_CONFIG="$tmp/vault.conf" bin/vault-link "$@"; }
+out="$(vl "Projects/Plan (draft).md")"
+[ "$out" = '[Plan (draft)](http://notes-host:4790/o/Projects/Plan%20%28draft%29)' ] \
+  && ok "vault-link: markdown link, path encoded, parentheses escaped, .md dropped" || bad "vault-link link" "$out"
+out="$(vl --url "$HOME/My Notes/a b/c.md") $(vl --url d --vault Other)"
+[ "$out" = 'http://notes-host:4790/o/a%20b/c http://notes-host:4790/o/d?vault=Other' ] && ok "vault-link: --url, absolute path, another vault" || bad "vault-link url" "$out"
+vl 2>/dev/null; [ $? = 2 ] && ok "vault-link: needs a note" || bad "vault-link no note"
+vl --bogus x 2>/dev/null; [ $? = 2 ] && ok "vault-link: refuses an unknown option" || bad "vault-link unknown option"
+bin/vault-link x 2>/dev/null; [ $? = 4 ] && ok "vault-link: says when it isn't configured" || bad "vault-link unconfigured"
+vport=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+CHIEFOFSTAFF_CONFIG="$tmp/vault.conf" bin/vault-link-server "$vport" & vpid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null "http://127.0.0.1:$vport/" && break; sleep 0.3; done
+page="$(curl -s "http://127.0.0.1:$vport/o/Projects/x%20(y).md")"
+grep -q "location.replace('obsidian://open?vault=My%20Notes&file=Projects%2Fx%20%28y%29')" <<<"$page" && grep -q 'Open in Obsidian' <<<"$page" \
+  && ok "vault-link-server: sends the browser to the note, with a button" || bad "vault-link-server page" "$page"
+page="$(curl -s -A 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)' "http://127.0.0.1:$vport/o/Projects/x")"
+grep -q "location.replace('obsidian://open?file=Projects%2Fx')" <<<"$page" && ok "vault-link-server: on a phone, leaves the vault to Obsidian" || bad "vault-link-server phone" "$page"
+page="$(curl -s -A 'iPhone' "http://127.0.0.1:$vport/o/x?vault=Other")"
+grep -q "vault=Other&file=x" <<<"$page" && ok "vault-link-server: a named vault is kept, even on a phone" || bad "vault-link-server vault" "$page"
+codes="$(for u in / /etc/passwd /o/ /o/a/../b; do curl -s --path-as-is -o /dev/null -w '%{http_code} ' "http://127.0.0.1:$vport$u"; done)"
+[ "$codes" = '404 404 404 404 ' ] && ok "vault-link-server: everything else is a 404" || bad "vault-link-server other paths" "$codes"
+kill "$vpid" 2>/dev/null; wait "$vpid" 2>/dev/null
+
 echo "sitrep-ping"
 printf '## Chiefofstaff run\n\n- Host: laptop\n- Run: `run_dddddddddddd`\n\n## Machines\n' > "$tmp/ledger3.md"
 for job in sitrep watch retro; do
@@ -787,6 +862,14 @@ sp watch; { grep -q 'Follow-up due: check the docs lead took its default (f1' "$
   && ok "watch: mails a due follow-up, retrying after a failed send" || bad "watch follow-up" "$(cat "$FAKE/sent" 2>/dev/null)"
 sp watch; [ ! -e "$FAKE/sent" ] && grep -q '"f2"' "$tmp/state2/follow-ups.json" && ! grep -q '"f1"' "$tmp/state2/follow-ups.json" \
   && ok "watch: a follow-up fires once; later ones stay pending" || bad "watch repeated a follow-up" "$(cat "$FAKE/sent" 2>/dev/null)"
+export CHIEFOFSTAFF_NOTICE_LOG="$tmp/sp-notices.jsonl"; : > "$CHIEFOFSTAFF_NOTICE_LOG"
+sp watch
+python3 -c 'import json; print(json.dumps({"ts":"t","bot":"alerts","source":"myapp/job","text":"Job failed: example task"}))' >> "$CHIEFOFSTAFF_NOTICE_LOG"
+touch "$FAKE/fail-send"; sp watch 2>/dev/null; rm -f "$FAKE/fail-send"
+sp watch; { grep -q '"Notices"' "$FAKE/sent" 2>/dev/null && grep -q 'Job failed: example task' "$FAKE/sent" && grep -q 'Notices)' "$FAKE/sent"; } \
+  && ok "watch: mails new notices, retrying after a failed send" || bad "watch notices" "$(cat "$FAKE/sent" 2>/dev/null)"
+sp watch; [ ! -e "$FAKE/sent" ] && ok "watch: a notice is mailed once" || bad "watch repeated a notice" "$(cat "$FAKE/sent" 2>/dev/null)"
+export CHIEFOFSTAFF_NOTICE_LOG="$tmp/no-notices.jsonl"
 
 echo "relay-message"
 rm_() { rm -f "$FAKE/sent"; CHIEFOFSTAFF_NO_PULL=1 CHIEFOFSTAFF_LEDGER="${RM_LEDGER:-$tmp/ledger4.md}" ORCA="$tmp/fake-orca" bin/relay-message "$@"; }

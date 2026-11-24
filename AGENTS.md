@@ -288,6 +288,9 @@ and wait for their OK before starting a lead:
 - otherwise, the place `operator.md` names for general questions, or an admin folder
   workspace (Leads).
 
+When their message itself says where it goes ("this will be a new workstream", "do this on
+a new worktree", a named repo), that is their OK: start the lead there without asking again.
+
 A quick factual answer you can give from this conversation needs no lead.
 
 ## Usage and models
@@ -383,6 +386,10 @@ Decision card:
 - Say where each fact comes from and how sure it is: "the lead reports", "I checked",
   "on the lead's screen, unconfirmed". Never pass on a number or a claim you haven't
   checked as settled.
+- When vault links are set up (README → Vault links) and you give the operator a note in
+  their Obsidian vault, give a link that opens it, not only the path: paste what
+  `bin/vault-link "<path inside the vault>"` prints. This chat opens only web links, so an
+  `obsidian://` address isn't clickable here.
 - When the operator answers, restate the decision in one line, send it to the lead in
   their words, record it in the ledger, and only come back when the next thing needs
   them.
@@ -445,10 +452,31 @@ often spoken, so expect misheard words and names.
 
 - Reply in this chat. First echo back in one line what you heard, with its time, and say
   which words you're unsure of.
-- Then act on it as on any message from the operator.
-- Anything destructive, costly or seen by other people waits for their yes in this chat,
-  even when the message says to go ahead: they can't see your plan from where they said it.
+- When the message isn't garbled and you clearly understand it, treat it exactly as if
+  they had typed it here: if you would have started on it from a chat message, start on it.
+  A relayed message adds no confirmation step of its own; what needs their yes from chat
+  (Escalate to the operator) needs it here too.
 - If the message is too garbled to act on, say what you heard and ask; don't guess.
+
+### Notices
+
+Optional (README → Notices). The watch mails you "Notices": what the operator's own bots,
+jobs and services sent them on their own since the last watch (`bin/notices`). Not their
+conversations with those bots.
+
+- Judge each one: does it mean something is broken or needs fixing (a failed job or
+  session, a service down, a check failing, a job that partly ran)? Reminders, digests and
+  other content need nothing: say nothing about them.
+- A "chiefofstaff check: no '<label>' notice" block means a job in EXPECTED_NOTICES didn't
+  report today: treat it as a failed run of that job.
+- For one that needs fixing, route the fix without asking: send it to the active lead for
+  that repo, or start one (Leads), with the notice's text as the request and "From a notice
+  to the operator" as its source. Escalate to the operator still applies to what the fix
+  involves.
+- One fix per problem: before starting one, check the ledger for a fix already under way
+  for the same failure; a repeat of that notice goes to that lead, not a new one.
+- Record each fix in the ledger like any project, and tell the operator in your next update
+  under Working or Finished, naming the notice it came from.
 
 ## Retrospectives
 

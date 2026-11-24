@@ -35,6 +35,27 @@ MACHINES=(
 # go only to chiefofstaff's chat.
 NOTIFY_CMD=""
 
+# Optional: notices (README → Notices). Your bots, jobs and services append what they send
+# you to this log, one JSON line each; the watch mails new ones to chiefofstaff. The log
+# lives on NOTICE_LOG_MACHINE (a name from MACHINES; empty: wherever chiefofstaff runs).
+NOTICE_LOG="~/.local/state/notices/notices.jsonl"
+NOTICE_LOG_MACHINE=""
+# Jobs that should send a notice every day, "label|source|text|from|by": from <by> (local
+# time), a day with no notice from <source> containing <text> since <from> is reported.
+EXPECTED_NOTICES=(
+  # "daily job|myapp/job|Job complete|01:00|07:00"
+)
+
+# Optional: vault links (README → Vault links), for an Obsidian vault. bin/vault-link-server
+# runs on one machine your devices reach as VAULT_LINK_HOST (a tailnet name, say) and hands
+# clicks on its links to Obsidian, since Orca's chat opens only web links.
+VAULT_NAME=""
+VAULT_LINK_HOST=""
+VAULT_LINK_PORT="4790"
+# The addresses vault-link-server listens on: loopback plus that machine's private-network
+# address. Never a public one.
+VAULT_LINK_ADDRS="127.0.0.1"
+
 # Scheduled wake-ups (bin/install-timers), in each machine's local time.
 SITREP_TIMES="08:30 12:30 17:30"
 WATCH_MINUTES=15

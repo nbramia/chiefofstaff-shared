@@ -213,7 +213,7 @@ only if the ledger's Host is this machine, so exactly one chiefofstaff wakes.
 | Job | When (default) | Mails chiefofstaff |
 |---|---|---|
 | `sitrep` | 08:30, 12:30, 17:30 | "Scheduled sitrep", with the ledger's open cards and `bin/lead-health`'s and `bin/usage`'s reports |
-| `watch` | every 15 min | "Follow-up due" for each `bin/follow-up` whose time has passed (once each, on the next run after the machine comes back if it was off); "Lead health alert" when `bin/lead-health --watch` finds a new problem; "Usage alert" when `bin/usage --watch` finds the tier worse, new switch advice, a threshold crossing, or a pause starting or ending |
+| `watch` | every 15 min | "Follow-up due" for each `bin/follow-up` whose time has passed (once each, on the next run after the machine comes back if it was off); "Notices" with what your bots and jobs sent you (README → Notices); "Lead health alert" when `bin/lead-health --watch` finds a new problem; "Usage alert" when `bin/usage --watch` finds the tier worse, new switch advice, a threshold crossing, or a pause starting or ending |
 | `retro` | Sundays 16:00 | "Scheduled retrospective", with `bin/open-work`'s list of open workspaces and lead chats for the weekly cleanup review |
 
 `bin/lead-health` lists each active lead in chiefofstaff's run as `ok` or `STALLED`, with
@@ -244,6 +244,67 @@ shortcut or a mail rule at it (message on stdin or as arguments). It finds the r
 ledger, goes through the paired Orca when chiefofstaff runs on another machine, and exits
 non-zero when nothing was sent, so the calling tool can retry. Chiefofstaff echoes back
 what it heard before acting (`AGENTS.md` → Relayed messages).
+
+### Notices
+
+Optional. Chiefofstaff can watch what your own bots, jobs and services send you on their
+own (a chat bot's alerts, a nightly job's summary) and route a fix when one means something
+is broken (`AGENTS.md` → Notices). A bot can't read back what it sent, so each sender also
+appends a copy of each notice to a log, `NOTICE_LOG` on `NOTICE_LOG_MACHINE`
+(`chiefofstaff.conf`), one JSON object per line:
+
+```
+{"ts": "2026-01-05T11:00:00Z", "bot": "alerts-bot", "source": "myapp/worker", "text": "Job failed: …"}
+```
+
+`ts` is UTC ISO 8601, `bot` names the bot or channel, `source` names the sender, `text` is
+the message as sent. Senders append one whole line per message, under a lock (`flock`),
+and never let a failed write stop the send. Leave out conversations: only notices a sender
+sends on its own.
+
+`bin/notices --watch`, run by the watch, prints the entries chiefofstaff hasn't seen (at
+most 30 a run; the rest come next time), skipping chiefofstaff's own notices (text starting
+`chiefofstaff:`), and `sitrep-ping watch` mails them as "Notices", marking them seen only
+after the mail went out. On first use on a machine it starts at the log's end, so old
+notices aren't replayed. From another machine it reads the log over ssh.
+`bin/notices --tail <n>` shows recent ones, seen or not.
+
+A job can also fail without sending anything (killed, crashed, never started). For a job
+that should report every day, add `"label|source|text|from|by"` to `EXPECTED_NOTICES`: from
+`by` (local time), a day with no entry from `source` containing `text` since `from` adds one
+"chiefofstaff check: no '<label>' notice" block to the mail, once a day. A log with nothing
+from before `from` is too new to judge, so it stays quiet.
+
+### Vault links
+
+Optional, for an Obsidian vault. Orca's chat opens only `http:`, `https:` and `mailto:`
+links, so an `obsidian://` link there isn't clickable. A note link is an ordinary web link
+instead: `bin/vault-link "<path inside the vault>"` prints
+`[<note name>](http://<VAULT_LINK_HOST>:<port>/o/<encoded path>)`, and
+`bin/vault-link-server` answers it with a small page that sends the browser on to
+`obsidian://open?vault=<VAULT_NAME>&file=<path>`, with an "Open in Obsidian" button, so the
+note opens on whichever device was clicked. On a phone it leaves the vault out unless the
+link names one, and Obsidian uses the vault it has open. The server answers nothing else
+(every other path is a 404) and listens only on `VAULT_LINK_ADDRS`: loopback plus an
+address your devices reach privately, such as a tailnet address, never a public one.
+
+Run the server as a service on one machine that your devices can reach, and set
+`VAULT_LINK_HOST` to the name they reach it by. Prefer a name to an IPv4 address: some
+IPv6-only networks rewrite IPv4 literals through NAT64, which bypasses a private network.
+A systemd user unit for it:
+
+```
+[Service]
+ExecStart=%h/Code/chiefofstaff/bin/vault-link-server
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+`Restart=always` covers a private-network address that isn't up yet at boot. A browser may
+ask before handing a link to another app, and the tab it opened stays open.
 
 After changing the schedule, rerun `bin/install-timers`. `bin/install-timers --remove`
 takes the jobs off a machine.
@@ -301,7 +362,8 @@ with two machines: syntax, configuration loading, the ledger helpers and
 de-duplication, `bin/lead-continue` and its check that a follow-up started, `bin/lead-move`,
 `bin/keep-open`, `bin/open-work` (including listings too large for an argument),
 `bin/follow-up` and the watch mailing each due one once, the sitrep mail's open cards,
-`bin/relay-message`, `bin/last-chat`, `ensure-project` reporting an Orca refusal, `bin/usage`'s pace, tiers, switch advice, thresholds and pauses
+`bin/relay-message`, `bin/notices` and the watch mailing each notice once (and expected
+notices that didn't come), `bin/vault-link` and `bin/vault-link-server`, `bin/last-chat`, `ensure-project` reporting an Orca refusal, `bin/usage`'s pace, tiers, switch advice, thresholds and pauses
 (on fixture snapshots), `sitrep-ping`'s three jobs acting only on chiefofstaff's machine,
 `bin/install-timers`' units, `start-chiefofstaff` refusing in a worktree, skill
 frontmatter, and that every path the docs mention exists. When `orca` and `gh` work and

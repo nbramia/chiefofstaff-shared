@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Notices: messages the operator's own bots, jobs and services sent them on their own
+# (failures, alerts, digests). Each sender also appends what it sent to a shared log; this
+# reads the entries chiefofstaff hasn't seen yet. The watch (bin/sitrep-ping watch) mails
+# them to the run as "Notices", and chiefofstaff decides which mean something needs fixing
+# (AGENTS.md → Notices). Optional: with no senders writing the log, it prints nothing.
+#
+#   notices            new entries since the last --ack, one block each (doesn't advance)
+#   notices --watch    the same, and remembers how far it read, for --ack
+#   notices --ack      mark what the last --watch printed as seen; sitrep-ping runs it only
+#                      after its mail went out, so a failed send is retried
+#   notices --tail <n> the last n entries, seen or not
+#
+# The log (chiefofstaff.conf): NOTICE_LOG, default ~/.local/state/notices/notices.jsonl, on
+# NOTICE_LOG_MACHINE (a name in MACHINES; empty: this machine), read over ssh from the
+# others. One JSON object per line: {"ts", "bot", "source", "text"} (README → Notices). On
+# first use on a machine, reading starts at the log's current end: old notices aren't
+# replayed. Chiefofstaff's own notices (text starting "chiefofstaff:") are skipped. At most
+# NOTICES_MAX entries (default 30) are printed per run; the rest wait for the next.
+#
+# Expected notices (EXPECTED_NOTICES in chiefofstaff.conf, "label|source|text|from|by"): a
+# job that should report every day can also fail without sending
+# anything. From <by> (HH:MM, this machine's local time) --watch adds one block, once a day,
+# when the log has no entry from <source> containing <text> since <from> that day. A log
+# with nothing from before <from> is too new to judge, so it stays quiet.
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+mode=list; tailn=""
+case "${1:-}" in
+  "") ;;
+  --watch) mode=watch ;;
+  --ack) mode=ack ;;
+  --tail) mode=tail; tailn="${2:?--tail needs a number}" ;;
+  *) sed -n '2,25p' "$0"; exit 2 ;;
+esac
+state="${CHIEFOFSTAFF_STATE_DIR:-$HOME/.local/state/chiefofstaff}"; mkdir -p "$state"
+st="$state/notices.json"
+log="${CHIEFOFSTAFF_NOTICE_LOG:-${NOTICE_LOG:-~/.local/state/notices/notices.jsonl}}"   # CHIEFOFSTAFF_NOTICE_LOG: tests
+remote=""
+if [ -n "${NOTICE_LOG_MACHINE:-}" ] && [ "$NOTICE_LOG_MACHINE" != "$CHIEFOFSTAFF_HOST" ]; then
+  remote="$(machine_field "$NOTICE_LOG_MACHINE" ssh)"
+  [ -n "$remote" ] || { echo "notices: NOTICE_LOG_MACHINE '$NOTICE_LOG_MACHINE' isn't in MACHINES" >&2; exit 2; }
+fi
+case "$log" in "~/"*) [ -n "$remote" ] || log="$HOME/${log#\~/}" ;; esac
+qlog="$(printf '%q' "$log")"; [ -z "$remote" ] || case "$log" in "~/"*) qlog="~/$(printf '%q' "${log#\~/}")" ;; esac
+
+run() {  # run <shell command>: here, or on NOTICE_LOG_MACHINE
+  if [ -n "$remote" ]; then ssh -o BatchMode=yes -o ConnectTimeout=10 "$remote" "$1"
+  else bash -c "$1"; fi
+}
+
+if [ "$mode" = ack ]; then
+  python3 - "$st" <<'PY'
+import json, sys
+p = sys.argv[1]
+try:
+    s = json.load(open(p))
+except Exception:
+    sys.exit(0)
+if "pending" in s:
+    s["offset"] = s.pop("pending")
+if "expected_pending" in s:
+    s.setdefault("expected_alerted", {}).update(s.pop("expected_pending"))
+json.dump(s, open(p, "w"))
+PY
+  exit 0
+fi
+
+offset="$(python3 -c '
+import json, sys
+try:
+    print(int(json.load(open(sys.argv[1])).get("offset", -1)))
+except Exception:
+    print(-1)' "$st")"
+[ "$mode" != tail ] || offset=0
+first=""
+if [ "$offset" -lt 0 ]; then first=1; offset=0; fi
+tmpf="$(mktemp)"; trap 'rm -f "$tmpf"' EXIT
+# "<size>\n" then the log's bytes from offset on (all of it when offset is past the end,
+# i.e. the log was replaced).
+run "f=$qlog; [ -f \"\$f\" ] || { echo 0; exit 0; }; s=\$(wc -c < \"\$f\"); s=\$((s+0)); o=$offset; [ \"\$o\" -le \"\$s\" ] || o=0; echo \$s; tail -c +\$((o+1)) \"\$f\"" > "$tmpf" \
+  || { echo "notices: can't read the log${remote:+ on $remote}" >&2; exit 1; }
+
+python3 - "$st" "$mode" "$offset" "$first" "${NOTICES_MAX:-30}" "$tailn" "$tmpf" <<'PY'
+import json, sys
+st, mode, offset, first, maxn, tailn = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5]), sys.argv[6]
+raw = open(sys.argv[7], "rb").read()
+nl = raw.find(b"\n")
+size = int(raw[:nl] or 0) if nl >= 0 else 0
+body = raw[nl + 1:] if nl >= 0 else b""
+if offset > size:
+    offset = 0
+if first and mode != "tail":
+    # First use on this machine: start at the end, don't replay history.
+    json.dump({"offset": size}, open(st, "w"))
+    sys.exit(0)
+# Only whole lines; a line still being written waits for the next run.
+end = body.rfind(b"\n") + 1
+entries, pos = [], 0
+for line in body[:end].split(b"\n")[:-1]:
+    pos += len(line) + 1
+    try:
+        e = json.loads(line)
+    except Exception:
+        e = {"text": line.decode("utf-8", "replace"), "source": "?", "bot": "?", "ts": ""}
+    if str(e.get("text", "")).lstrip().startswith("chiefofstaff:"):
+        entries.append((pos, None)); continue
+    entries.append((pos, e))
+if mode == "tail":
+    shown = [e for _, e in entries if e][-int(tailn):]
+    stop = None
+else:
+    shown, stop = [], 0
+    for p, e in entries:
+        if e and len(shown) >= maxn:
+            break
+        stop = p
+        if e:
+            shown.append(e)
+for e in shown:
+    text = str(e.get("text", "")).strip()
+    if len(text) > 2000:
+        text = text[:2000] + " […]"
+    print(f"--- {e.get('ts', '')} {e.get('bot', '?')}, from {e.get('source', '?')}:")
+    print(text)
+rest = sum(1 for p, e in entries if e and stop is not None and p > stop)
+if rest:
+    print(f"({rest} more waiting; they come with the next watch)")
+if mode == "watch":
+    try:
+        s = json.load(open(st))
+    except Exception:
+        s = {}
+    s["pending"] = offset + (stop or 0)
+    s.setdefault("offset", offset)
+    json.dump(s, open(st, "w"))
+PY
+
+# Expected notices: read the log's last 512 KB (a few days of notices).
+[ "$mode" != tail ] && [ "${#EXPECTED_NOTICES[@]}" -gt 0 ] || exit 0
+run "f=$qlog; if [ -f \"\$f\" ]; then echo present; tail -c 524288 \"\$f\"; else echo missing; fi" > "$tmpf" 2>/dev/null || exit 0
+python3 - "$st" "$mode" "$tmpf" "${CHIEFOFSTAFF_NOW:-}" "${EXPECTED_NOTICES[@]}" <<'PY'
+import json, sys, time
+from datetime import datetime, timezone
+st, mode, path, now_s = sys.argv[1:5]
+expected = sys.argv[5:]
+now = datetime.fromtimestamp(int(now_s) if now_s else time.time()).astimezone()
+day = now.date().isoformat()
+try:
+    s = json.load(open(st))
+except Exception:
+    s = {}
+raw = open(path, "rb").read()
+present = raw.startswith(b"present")
+entries = []
+for line in raw.split(b"\n")[1:]:
+    try:
+        e = json.loads(line)
+        ts = datetime.fromisoformat(str(e.get("ts", "")).replace("Z", "+00:00"))
+    except Exception:
+        continue
+    entries.append((ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc), e))
+pending = {}
+for spec in expected:
+    parts = spec.split("|")
+    if len(parts) != 5:
+        print(f"notices: EXPECTED_NOTICES entry {spec!r} isn't label|source|text|from|by", file=sys.stderr)
+        continue
+    label, source, text, frm, by = parts
+    bh, bm = (int(x) for x in by.split(":"))
+    if (now.hour, now.minute) < (bh, bm) or s.get("expected_alerted", {}).get(label) == day:
+        continue
+    fh, fm = (int(x) for x in frm.split(":"))
+    since = now.replace(hour=fh, minute=fm, second=0, microsecond=0)
+    if any(ts >= since and e.get("source") == source and text in str(e.get("text", "")) for ts, e in entries):
+        continue
+    if present and not any(ts < since for ts, _ in entries):
+        continue  # too new to judge
+    print(f"--- {day} chiefofstaff check: no '{label}' notice")
+    print(f"The notices log has no entry from {source} containing '{text}' since {frm} today "
+          f"(checked {now:%H:%M}){'' if present else '; the log itself is missing'}. The job "
+          "failed, was killed, or never ran: look at its own logs.")
+    pending[label] = day
+if mode == "watch" and pending:
+    s["expected_pending"] = pending
+    json.dump(s, open(st, "w"))
+PY
