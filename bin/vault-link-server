@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Hand a click on an ordinary web link to Obsidian. Orca's chat opens only http, https and
+# mailto links, so a link to a vault note is http://<VAULT_LINK_HOST>:<port>/o/<note
+# path>[?vault=<name>] (bin/vault-link builds them): this server answers it with a small
+# page that sends the browser on to obsidian://open?vault=<name>&file=<note path>, so
+# Obsidian opens the note on whichever device was clicked. On a phone, unless the link
+# names a vault, it is left out and Obsidian uses the vault it has open. It serves nothing
+# else (every other path is a 404) and listens only on VAULT_LINK_ADDRS (chiefofstaff.conf:
+# loopback and a private-network address, never a public one). Run it as a service on one
+# machine (README → Vault links).
+#
+#   vault-link-server [port]     default VAULT_LINK_PORT, else 4790
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+[ -n "$VAULT_NAME" ] || { echo "vault-link-server: set VAULT_NAME in chiefofstaff.conf" >&2; exit 4; }
+exec python3 -I - "${1:-${VAULT_LINK_PORT:-4790}}" "$VAULT_NAME" ${VAULT_LINK_ADDRS:-127.0.0.1} <<'PY'
+import html, http.server, sys, threading
+from urllib.parse import quote, unquote, urlsplit, parse_qs
+port, default_vault, addrs = int(sys.argv[1]), sys.argv[2], sys.argv[3:]
+
+def obsidian_url(note, vault):
+    v = f"vault={quote(vault, safe='')}&" if vault else ""
+    return f"obsidian://open?{v}file={quote(note, safe='')}"
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def send(self, code, body, ctype="text/html; charset=utf-8"):
+        body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Robots-Tag", "noindex")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlsplit(self.path)
+        if not u.path.startswith("/o/"):
+            return self.send(404, "Not found", "text/plain; charset=utf-8")
+        note = unquote(u.path[3:]).strip("/")
+        if note.endswith(".md"):
+            note = note[:-3]
+        vault = (parse_qs(u.query).get("vault") or [None])[0]
+        if vault is None:
+            # A phone's vault may have another name; without one, Obsidian opens the note
+            # in the vault it has open.
+            ua = self.headers.get("User-Agent", "")
+            vault = "" if any(m in ua for m in ("iPhone", "iPad", "Android")) else default_vault
+        if not note or "\x00" in note or any(p == ".." for p in note.split("/")) or len(note) > 1000:
+            return self.send(404, "Not found", "text/plain; charset=utf-8")
+        target = obsidian_url(note, vault)
+        t, name = html.escape(target, quote=True), html.escape(note.rsplit("/", 1)[-1])
+        self.send(200, f"""<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>{name} · Obsidian</title>
+<style>body{{font:17px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;max-width:520px;margin:48px auto;padding:0 16px;background:#f7f4ee;color:#22201c}}
+@media(prefers-color-scheme:dark){{body{{background:#16150f;color:#ece7dc}}a{{color:#b39dfa}}}}
+a.b{{display:inline-block;margin-top:8px;padding:10px 16px;border-radius:8px;background:#7c5cff;color:#fff;text-decoration:none}}</style>
+<p>Opening <b>{name}</b> in Obsidian…</p>
+<p><a class=b href="{t}">Open in Obsidian</a></p>
+<p style="opacity:.7">You can close this tab.</p>
+<script>location.replace({target!r});setTimeout(function(){{window.close()}},1500)</script>
+""")
+
+    def log_message(self, *a):
+        pass
+
+servers = [http.server.ThreadingHTTPServer((a, port), Handler) for a in addrs]
+for s in servers[1:]:
+    threading.Thread(target=s.serve_forever, daemon=True).start()
+servers[0].serve_forever()
+PY

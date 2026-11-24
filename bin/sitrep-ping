@@ -8,8 +8,10 @@
 #   sitrep-ping watch      every 15 min: mail only if bin/lead-health --watch found a new
 #                          problem or bin/usage --watch advises a change (including the 95%
 #                          pause starting or ending); `Threshold:` lines (80%/90% of a window)
-#                          also go to NOTIFY_CMD (chiefofstaff.conf), if set; and "Follow-up
-#                          due" for each bin/follow-up whose time has passed (once each)
+#                          also go to NOTIFY_CMD (chiefofstaff.conf), if set; "Follow-up
+#                          due" for each bin/follow-up whose time has passed (once each); and
+#                          "Notices" with what the operator's bots and jobs sent them since
+#                          the last watch (bin/notices)
 #   sitrep-ping retro      weekly: start a retrospective (AGENTS.md → Retrospectives), with
 #                          bin/open-work's list of open workspaces and lead chats for review
 set -euo pipefail
@@ -44,13 +46,23 @@ $(usage)" ;;
     # A failed usage check must not ack an earlier, unsent alert.
     uok=1; ureport="$("$CHIEFOFSTAFF_DIR/bin/usage" --watch 2>&1)" || { uok=""; ureport=""; }
     freport="$("$CHIEFOFSTAFF_DIR/bin/follow-up" --due 2>&1 || true)"
-    [ -n "$report" ] || [ -n "$ureport" ] || [ -n "$freport" ] || exit 0
+    # A failed read must not ack: no output, and the next watch reads the same entries.
+    nreport="$("$CHIEFOFSTAFF_DIR/bin/notices" --watch 2>/dev/null || true)"
+    [ -n "$report" ] || [ -n "$ureport" ] || [ -n "$freport" ] || [ -n "$nreport" ] || exit 0
     subject="" body=""
     if [ -n "$freport" ]; then
       subject="Follow-up due"
       body="A follow-up you set with bin/follow-up is due. Do what it says now.
 
 $freport"
+    fi
+    if [ -n "$nreport" ]; then
+      subject="${subject:+$subject + }Notices"
+      body="${body:+$body
+
+}$OPERATOR_NAME's bots and jobs sent them these since the last watch (a 'chiefofstaff check' block means an expected notice didn't come). For each, decide whether it means something needs fixing, and if so route the fix without asking (AGENTS.md → Notices).
+
+$nreport"
     fi
     if [ -n "$report" ]; then
       subject="${subject:+$subject + }Lead health alert"
@@ -96,5 +108,6 @@ if [ "$mode" = watch ]; then
   fids="$(grep -oE '\(f[0-9]+, set ' <<<"$freport" | grep -oE 'f[0-9]+' || true)"
   # shellcheck disable=SC2086
   [ -z "$fids" ] || "$CHIEFOFSTAFF_DIR/bin/follow-up" --ack $fids || true
+  [ -z "$nreport" ] || "$CHIEFOFSTAFF_DIR/bin/notices" --ack || true
   [ -z "$uok" ] || [ -z "$tok" ] || "$CHIEFOFSTAFF_DIR/bin/usage" --ack || true
 fi

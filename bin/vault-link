@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# A clickable link to a note in the operator's Obsidian vault, for the chiefofstaff chat.
+# Orca's chat opens only http, https and mailto links, not obsidian://, so the link goes
+# through bin/vault-link-server, which sends the browser on to Obsidian on whichever device
+# was clicked (README → Vault links). Needs VAULT_NAME and VAULT_LINK_HOST in
+# chiefofstaff.conf.
+#
+#   vault-link <note path> [--vault <name>] [--text <link text>]
+#       prints a markdown link: [<text>](http://<VAULT_LINK_HOST>:<port>/o/<encoded path>)
+#       <note path> is relative to the vault root, with or without .md; an absolute path
+#       inside ~/<vault name> works too. The default text is the note's name.
+#   vault-link --url <note path> [--vault <name>]   just the URL
+set -euo pipefail
+. "$(dirname "$0")/_common.sh"
+[ -n "$VAULT_NAME" ] && [ -n "$VAULT_LINK_HOST" ] \
+  || { echo "vault-link: set VAULT_NAME and VAULT_LINK_HOST in chiefofstaff.conf (README → Vault links)" >&2; exit 4; }
+exec python3 - "$VAULT_NAME" "http://$VAULT_LINK_HOST:${VAULT_LINK_PORT:-4790}" "$0" "$@" <<'PY'
+import os, sys
+from urllib.parse import quote
+default_vault, base, me, argv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+def usage():
+    print("".join(l[2:] for l in open(me).readlines()[1:12]), file=sys.stderr, end="")
+    sys.exit(2)
+vault, text, url_only, note, i = default_vault, None, False, None, 0
+while i < len(argv):
+    a = argv[i]
+    if a in ("--vault", "--text") and i + 1 < len(argv):
+        if a == "--vault":
+            vault = argv[i + 1]
+        else:
+            text = argv[i + 1]
+        i += 2
+    elif a == "--url":
+        url_only, i = True, i + 1
+    elif a.startswith("--") or note is not None:
+        usage()
+    else:
+        note, i = a, i + 1
+if not note:
+    usage()
+root = os.path.expanduser(f"~/{vault}")
+if note.startswith(root + "/"):
+    note = note[len(root) + 1:]
+note = note.strip("/")
+if note.endswith(".md"):
+    note = note[:-3]
+url = f"{base}/o/{quote(note, safe='/')}"
+if vault != default_vault:
+    url += f"?vault={quote(vault, safe='')}"
+if url_only:
+    print(url)
+else:
+    label = (text or note.rsplit("/", 1)[-1]).replace("[", "(").replace("]", ")")
+    print(f"[{label}]({url})")
+PY
